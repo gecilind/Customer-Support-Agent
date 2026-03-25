@@ -10,3 +10,4 @@ python-dotenv
 python-multipart
 openai
 pypdf
+pymupdf
