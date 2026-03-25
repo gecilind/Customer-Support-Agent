@@ -12,7 +12,7 @@ class ManualRepository:
         *,
         source: str,
         category: str,
-        sections_and_chunks: list[tuple[str, int, str]],
+        sections_and_chunks: list[tuple[str, int, str, list[float]]],
     ) -> int:
         rows = [
             Manual(
@@ -21,9 +21,9 @@ class ManualRepository:
                 content=content,
                 category=category,
                 chunk_index=chunk_index,
-                embedding=None,
+                embedding=embedding,
             )
-            for section, chunk_index, content in sections_and_chunks
+            for section, chunk_index, content, embedding in sections_and_chunks
         ]
 
         self.session.add_all(rows)

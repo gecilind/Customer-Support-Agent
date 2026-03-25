@@ -12,6 +12,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
     supabase_db_url: str = Field(alias="SUPABASE_DB_URL")
+    openai_api_key: str = Field(alias="OPENAI_KEY")
+    openai_chat_model: str = Field(default="gpt-4o-mini")
 
     @classmethod
     def settings_customise_sources(
