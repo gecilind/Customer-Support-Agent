@@ -67,24 +67,41 @@ function normalizeAssistantText(raw: string): string {
   return out.join('\n');
 }
 
+/** Drop blank lines between consecutive bullet rows so lists stay visually tight. */
+function collapseBlankLinesBetweenBullets(lines: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.trim() === '') {
+      const prev = out[out.length - 1];
+      const nextNonEmpty = lines.slice(i + 1).find((l) => l.trim() !== '');
+      if (prev?.trimStart().startsWith('• ') && nextNonEmpty?.trimStart().startsWith('• ')) {
+        continue;
+      }
+    }
+    out.push(line);
+  }
+  return out;
+}
+
 function renderAssistantMessage(text: string): React.ReactNode {
   if (!text) {
     return null;
   }
-  const lines = text.split('\n');
+  const lines = collapseBlankLinesBetweenBullets(text.split('\n'));
   return (
-    <div className="space-y-2">
+    <div className="flex flex-col gap-1">
       {lines.map((line, idx) => {
         if (line.trim() === '') {
-          return <div key={idx} className="h-1.5 shrink-0" aria-hidden />;
+          return <div key={idx} className="h-1 shrink-0" aria-hidden />;
         }
         if (line.startsWith('• ')) {
           return (
-            <div key={idx} className="flex gap-2 items-start">
-              <span className="shrink-0 text-slate-600 select-none" aria-hidden>
+            <div key={idx} className="flex gap-2 items-start py-0 leading-snug">
+              <span className="shrink-0 text-slate-600 select-none pt-0.5" aria-hidden>
                 •
               </span>
-              <span className="flex-1 min-w-0 leading-relaxed">{line.slice(2)}</span>
+              <span className="flex-1 min-w-0">{line.slice(2)}</span>
             </div>
           );
         }
@@ -119,18 +136,85 @@ function TypewriterText({ fullText, speed = 15, onComplete, onProgress }: Typewr
       return;
     }
 
-    let i = 0;
-    const timer = window.setInterval(() => {
-      i += 1;
-      setDisplayedText(fullText.slice(0, i));
-      onProgressRef.current?.();
-      if (i >= fullText.length) {
-        clearInterval(timer);
+    const start = performance.now();
+    let rafId = 0;
+    let intervalId: number | undefined;
+    let done = false;
+    let lastProgressAt = 0;
+    const PROGRESS_MIN_MS = 50;
+
+    const tick = () => {
+      if (done) return;
+      const elapsed = performance.now() - start;
+      const n = Math.min(fullText.length, Math.floor(elapsed / speed));
+      setDisplayedText(fullText.slice(0, n));
+
+      const now = performance.now();
+      const finished = n >= fullText.length;
+      if (finished || now - lastProgressAt >= PROGRESS_MIN_MS) {
+        lastProgressAt = now;
+        onProgressRef.current?.();
+      }
+
+      if (finished) {
+        done = true;
+        if (intervalId !== undefined) {
+          clearInterval(intervalId);
+          intervalId = undefined;
+        }
         onCompleteRef.current?.();
       }
-    }, speed);
+    };
 
-    return () => clearInterval(timer);
+    const rafLoop = () => {
+      tick();
+      if (!done) {
+        rafId = requestAnimationFrame(rafLoop);
+      }
+    };
+
+    const startBackgroundPump = () => {
+      if (intervalId !== undefined) return;
+      intervalId = window.setInterval(tick, 120);
+    };
+
+    const stopBackgroundPump = () => {
+      if (intervalId !== undefined) {
+        clearInterval(intervalId);
+        intervalId = undefined;
+      }
+    };
+
+    const syncVisibility = () => {
+      if (done) return;
+      if (document.hidden) {
+        cancelAnimationFrame(rafId);
+        startBackgroundPump();
+      } else {
+        stopBackgroundPump();
+        tick();
+        if (!done) {
+          rafId = requestAnimationFrame(rafLoop);
+        }
+      }
+    };
+
+    tick();
+    if (!done) {
+      if (document.hidden) {
+        startBackgroundPump();
+      } else {
+        rafId = requestAnimationFrame(rafLoop);
+      }
+    }
+    document.addEventListener('visibilitychange', syncVisibility);
+
+    return () => {
+      done = true;
+      cancelAnimationFrame(rafId);
+      stopBackgroundPump();
+      document.removeEventListener('visibilitychange', syncVisibility);
+    };
   }, [fullText, speed]);
 
   return <>{renderAssistantMessage(displayedText)}</>;
@@ -148,9 +232,32 @@ export function ChatInterface({ onBack }: ChatInterfaceProps) {
   const [conversationReady, setConversationReady] = useState(false);
   const [animatingMessageId, setAnimatingMessageId] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const stickToBottomRef = useRef(true);
 
-  const scrollToBottom = useCallback(() => {
+  const SCROLL_NEAR_BOTTOM_PX = 80;
+
+  const updateStickToBottom = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) {
+      return;
+    }
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickToBottomRef.current = distanceFromBottom < SCROLL_NEAR_BOTTOM_PX;
+  }, []);
+
+  const scrollToBottomIfPinned = useCallback(() => {
+    if (!stickToBottomRef.current) {
+      return;
+    }
+    const el = scrollRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, []);
+
+  const forceScrollToBottom = useCallback(() => {
+    stickToBottomRef.current = true;
     const el = scrollRef.current;
     if (el) {
       el.scrollTop = el.scrollHeight;
@@ -232,8 +339,8 @@ export function ChatInterface({ onBack }: ChatInterfaceProps) {
   }, []);
 
   useEffect(() => {
-    scrollToBottom();
-  }, [messages, isLoading, scrollToBottom]);
+    scrollToBottomIfPinned();
+  }, [messages, isLoading, scrollToBottomIfPinned]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -251,6 +358,10 @@ export function ChatInterface({ onBack }: ChatInterfaceProps) {
 
     setMessages((prev) => [...prev, userMessage]);
     setInputValue('');
+    stickToBottomRef.current = true;
+    queueMicrotask(() => {
+      forceScrollToBottom();
+    });
     setIsLoading(true);
 
     try {
@@ -325,6 +436,7 @@ export function ChatInterface({ onBack }: ChatInterfaceProps) {
       {/* Chat History Area */}
       <div
         ref={scrollRef}
+        onScroll={updateStickToBottom}
         className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6"
       >
         {!conversationReady && !conversationId ? (
@@ -355,7 +467,7 @@ export function ChatInterface({ onBack }: ChatInterfaceProps) {
                     <TypewriterText
                       fullText={normalizeAssistantText(msg.content)}
                       speed={15}
-                      onProgress={scrollToBottom}
+                      onProgress={scrollToBottomIfPinned}
                       onComplete={() => {
                         setAnimatingMessageId(null);
                         inputRef.current?.focus();
@@ -385,15 +497,23 @@ export function ChatInterface({ onBack }: ChatInterfaceProps) {
 
       {/* Input Area */}
       <div className="p-4 bg-white border-t border-slate-200 shrink-0">
-        <form onSubmit={handleSubmit} className="flex gap-2">
-          <input
+        <form onSubmit={handleSubmit} className="flex gap-2 items-end">
+          <textarea
             ref={inputRef}
-            type="text"
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+                e.preventDefault();
+                if (canSend) {
+                  e.currentTarget.form?.requestSubmit();
+                }
+              }
+            }}
+            rows={1}
             placeholder="Type your message..."
             disabled={!conversationId || !conversationReady || isLoading || isTyping}
-            className="flex-1 border border-slate-300 rounded-sm px-3.5 py-2.5 text-sm focus:outline-none focus:border-blue-900 focus:ring-1 focus:ring-blue-900 placeholder:text-slate-400 transition-shadow disabled:bg-slate-100 disabled:text-slate-500"
+            className="flex-1 min-h-[44px] max-h-40 resize-none border border-slate-300 rounded-sm px-3.5 py-2.5 text-sm focus:outline-none focus:border-blue-900 focus:ring-1 focus:ring-blue-900 placeholder:text-slate-400 transition-shadow disabled:bg-slate-100 disabled:text-slate-500"
           />
           <button
             type="submit"

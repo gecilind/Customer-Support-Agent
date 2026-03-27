@@ -8,7 +8,7 @@ class KBRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
-    async def search(self, embedding: list[float], limit: int = 10) -> list[dict]:
+    async def search(self, embedding: list[float], limit: int = 5) -> list[dict]:
         """pgvector similarity via pgvector.sqlalchemy — order by cosine distance, similarity = 1 - distance."""
         distance_expr = Manual.embedding.cosine_distance(embedding)
         similarity_expr = (literal(1) - distance_expr).label("similarity")

@@ -7,6 +7,10 @@ from services.embedding_service import EmbeddingService
 
 # Numbered / decimal section titles: "1. Getting Started", "2.1 OPC UA", "2.1.1.1 How to use..."
 _RE_NUMBERED_HEADER = re.compile(r"^\d+(\.\d+)*\.?\s+\S")
+# Nested outline numbers (2.1, 4.3.14, …) are always section headers — never procedure steps.
+_RE_NESTED_NUMBERED_START = re.compile(r"^\d+\.\d+")
+# Single top-level number + space ("5. Lift the…") — may be a real title or a numbered step.
+_RE_SIMPLE_NUMBERED_START = re.compile(r"^(\d+)\.\s+")
 _RE_CHAPTER_HEADER = re.compile(r"^Chapter\s+\d+", re.IGNORECASE)
 _RE_MARKDOWN_HEADER = re.compile(r"^#{1,6}\s+")
 
@@ -99,22 +103,71 @@ class IngestionService:
             if not stripped:
                 prev_line_blank = True
                 continue
-            if self._is_section_header_line(stripped, prev_line_blank, i):
+            if self._is_section_header_line(stripped, prev_line_blank, i, lines):
                 indices.append(i)
             prev_line_blank = False
         return indices
 
-    def _is_section_header_line(self, stripped: str, prev_line_blank: bool, line_idx: int) -> bool:
+    def _is_section_header_line(
+        self, stripped: str, prev_line_blank: bool, line_idx: int, lines: list[str]
+    ) -> bool:
         if _RE_MARKDOWN_HEADER.match(stripped):
             return True
         if _RE_CHAPTER_HEADER.match(stripped):
             return True
         if _RE_NUMBERED_HEADER.match(stripped):
+            if _RE_NESTED_NUMBERED_START.match(stripped):
+                return True
+            if _RE_SIMPLE_NUMBERED_START.match(stripped):
+                return self._is_simple_numbered_section_header(
+                    stripped, prev_line_blank, line_idx, lines
+                )
             return True
         if prev_line_blank or line_idx == 0:
             if 3 <= len(stripped) <= 100 and self._is_all_caps_header_line(stripped):
                 return True
         return False
+
+    def _neighbor_non_empty_stripped(self, lines: list[str], line_idx: int) -> tuple[str | None, str | None]:
+        prev_text: str | None = None
+        for j in range(line_idx - 1, -1, -1):
+            s = lines[j].strip()
+            if s:
+                prev_text = s
+                break
+        next_text: str | None = None
+        for j in range(line_idx + 1, len(lines)):
+            s = lines[j].strip()
+            if s:
+                next_text = s
+                break
+        return prev_text, next_text
+
+    def _is_simple_numbered_section_header(
+        self, stripped: str, prev_line_blank: bool, line_idx: int, lines: list[str]
+    ) -> bool:
+        """True if a simple 'N. Title' line is a document section header, not a procedure step."""
+        m = _RE_SIMPLE_NUMBERED_START.match(stripped)
+        if not m:
+            return False
+        current_num = int(m.group(1))
+
+        if line_idx > 0 and not prev_line_blank:
+            return False
+
+        prev_text, next_text = self._neighbor_non_empty_stripped(lines, line_idx)
+
+        if prev_text is not None:
+            pm = _RE_SIMPLE_NUMBERED_START.match(prev_text)
+            if pm and int(pm.group(1)) == current_num - 1:
+                return False
+
+        if next_text is not None:
+            nm = _RE_SIMPLE_NUMBERED_START.match(next_text)
+            if nm and int(nm.group(1)) == current_num + 1:
+                return False
+
+        return True
 
     @staticmethod
     def _is_all_caps_header_line(s: str) -> bool:

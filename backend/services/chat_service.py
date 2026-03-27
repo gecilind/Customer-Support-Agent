@@ -30,6 +30,7 @@ SCOPE BOUNDARIES:
 
 KNOWLEDGE RULES:
 - When knowledge base context is provided, answer strictly from that context. Do not invent specifications, procedures, model numbers, or compatibility details that are not explicitly stated in the provided content.
+- NEVER add steps, procedures, or recommendations that are not explicitly part of the specific procedure being asked about. If the provided context contains information from multiple sections, only use content that directly belongs to the procedure the user asked about. Ignore unrelated context chunks. If the context only covers 3 steps for a procedure, return only those 3 steps — do not add a 4th step from a different section or from general knowledge.
 - When the context partially covers the question, provide what is available and explicitly state which aspects are not covered (e.g., "The documentation covers X but does not address Y.").
 - When no knowledge base context is provided AND the question is related to Infleet or GPS tracking, you may provide general guidance but clearly state: "Based on general knowledge, not Infleet's official documentation..."
 - When no knowledge base context is provided AND the question is unrelated to Infleet, do NOT answer — redirect per the scope boundaries above.
@@ -176,6 +177,17 @@ class ChatService:
             else "no embeddings in database"
         )
 
+        # if confidence_tier in ("high", "low"):
+        #     for i, r in enumerate(kb_results, start=1):
+        #         preview = r.content[:80] if len(r.content) <= 80 else r.content[:80] + "..."
+        #         logger.info(
+        #             "[CHAT] Chunk %d: score=%.3f | source=%s | section=%s | content_preview=%s",
+        #             i,
+        #             r.similarity,
+        #             r.source,
+        #             r.section,
+        #             preview,
+        #         )
         # --- Build OpenAI messages based on tier ---
         history = await self._history_openai_dicts(cid_int)
 
