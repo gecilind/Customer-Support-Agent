@@ -30,6 +30,7 @@ SCOPE BOUNDARIES:
 
 KNOWLEDGE RULES:
 - When knowledge base context is provided, answer strictly from that context. Do not invent specifications, procedures, model numbers, or compatibility details that are not explicitly stated in the provided content.
+- If the provided context does not directly answer the user's question, say so explicitly — for example: "The documentation provided doesn't contain a direct answer to this question. Could you rephrase, or would you like me to search for something more specific?" Do NOT fill gaps with your own general knowledge. A partial match in the context is not permission to complete the answer from your training data.
 - NEVER add steps, procedures, or recommendations that are not explicitly part of the specific procedure being asked about. If the provided context contains information from multiple sections, only use content that directly belongs to the procedure the user asked about. Ignore unrelated context chunks. If the context only covers 3 steps for a procedure, return only those 3 steps — do not add a 4th step from a different section or from general knowledge.
 - When the context partially covers the question, provide what is available and explicitly state which aspects are not covered (e.g., "The documentation covers X but does not address Y.").
 - When no knowledge base context is provided AND the question is related to Infleet or GPS tracking, you may provide general guidance but clearly state: "Based on general knowledge, not Infleet's official documentation..."
@@ -72,9 +73,6 @@ CLOSING:
 - If the answer is partial, end by stating what information is missing or suggest the user contact Infleet support for further assistance.
 - Never end with both a partial-answer disclaimer and the "anything else" closing — pick one."""
 
-LOW_CONFIDENCE_PREFIX = (
-    "I found some related information, but I'm not fully certain this answers your question:\n\n"
-)
 
 # Confidence tiers (top result similarity). Tuned for text-embedding-3-small + small chunks.
 TIER_HIGH_MIN = 0.60
@@ -228,7 +226,12 @@ class ChatService:
         top = kb_results[0]
 
         kb_user_content = (
-            f"Context from knowledge base:\n\n{context_str}\n\nUser question: {message}"
+            f"Context from knowledge base:\n\n{context_str}\n\n"
+            f"INSTRUCTION: Answer the following question using ONLY the context above. "
+            f"If the context does not contain a clear, direct answer to the question, "
+            f"state that the documentation does not cover this topic. "
+            f"Do NOT supplement with your own knowledge.\n\n"
+            f"User question: {message}"
         )
         openai_messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -238,7 +241,7 @@ class ChatService:
         raw_ai = await self._call_openai(openai_messages)
 
         if confidence_tier == "low":
-            ai_response = LOW_CONFIDENCE_PREFIX + raw_ai
+            ai_response = raw_ai
             await self.conversation_repository.add_message(
                 cid_int, role="assistant", content=ai_response, confidence_tier="low"
             )
