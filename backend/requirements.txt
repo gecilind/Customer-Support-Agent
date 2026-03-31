@@ -9,5 +9,6 @@ pydantic-settings
 python-dotenv
 python-multipart
 openai
+httpx
 pypdf
 pymupdf

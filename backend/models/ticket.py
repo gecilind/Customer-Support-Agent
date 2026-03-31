@@ -16,7 +16,7 @@ class Ticket(Base):
     jira_ticket_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)
     issue_type: Mapped[str] = mapped_column(String(100), nullable=False)
     severity: Mapped[str] = mapped_column(String(50), nullable=False, default="medium", server_default="medium")
-    device_serial: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    device_serial: Mapped[str | None] = mapped_column(String(200), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

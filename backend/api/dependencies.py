@@ -11,17 +11,20 @@ from api.controllers.conversation_controller import ConversationController
 from api.controllers.health_controller import HealthController
 from api.controllers.ingest_controller import IngestController
 from api.controllers.manual_controller import ManualController
+from api.controllers.ticket_controller import TicketController
 from config import Settings, get_settings
 from repositories.conversation_repository import ConversationRepository
 from repositories.health_repository import HealthRepository
 from repositories.kb_repository import KBRepository
 from repositories.manual_repository import ManualRepository
+from repositories.ticket_repository import TicketRepository
 from services.chat_service import ChatService
 from services.embedding_service import EmbeddingService
 from services.health_service import HealthService
 from services.ingestion_service import IngestionService
 from services.kb_service import KBService
 from services.manual_service import ManualService
+from services.ticket_service import TicketService
 
 
 def get_app_settings() -> Settings:
@@ -119,3 +122,27 @@ def get_conversation_controller(
     conversation_repository: ConversationRepository = Depends(get_conversation_repository),
 ) -> ConversationController:
     return ConversationController(conversation_repository)
+
+
+def get_ticket_repository(
+    request: Request,
+    session: AsyncSession = Depends(get_supabase_session),
+    settings: Settings = Depends(get_app_settings),
+) -> TicketRepository:
+    return TicketRepository(
+        http_client=request.app.state.http_client,
+        session=session,
+        settings=settings,
+    )
+
+
+def get_ticket_service(
+    ticket_repository: TicketRepository = Depends(get_ticket_repository),
+) -> TicketService:
+    return TicketService(ticket_repository)
+
+
+def get_ticket_controller(
+    ticket_service: TicketService = Depends(get_ticket_service),
+) -> TicketController:
+    return TicketController(ticket_service)

@@ -8,3 +8,11 @@ class IngestionError(AppError):
     def __init__(self, message: str) -> None:
         self.message = message
         super().__init__(message)
+
+
+class JiraAPIError(AppError):
+    """Raised when Jira REST API call fails."""
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+        super().__init__(message)

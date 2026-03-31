@@ -15,6 +15,11 @@ class Settings(BaseSettings):
     openai_api_key: str = Field(alias="OPENAI_KEY")
     openai_chat_model: str = Field(default="gpt-4o-mini")
 
+    jira_base_url: str = Field(alias="JIRA_BASE_URL")
+    jira_email: str = Field(alias="JIRA_EMAIL")
+    jira_api_token: str = Field(alias="JIRA_API_TOKEN")
+    jira_project_key: str = Field(alias="JIRA_PROJECT_KEY")
+
     @classmethod
     def settings_customise_sources(
         cls,
