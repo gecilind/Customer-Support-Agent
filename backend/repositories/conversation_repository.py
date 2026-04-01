@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 from typing import Sequence
 
 from sqlalchemy import select
@@ -55,3 +56,20 @@ class ConversationRepository:
         )
         result = await self.session.execute(stmt)
         return result.scalars().all()
+
+    async def update_status(self, conversation_id: int, status: str) -> None:
+        conv = await self.get_by_id(conversation_id)
+        if conv is None:
+            return
+        conv.status = status
+        conv.updated_at = datetime.now(timezone.utc)
+        await self.session.commit()
+
+    async def update_device_serial(self, conversation_id: int, device_serial: str) -> None:
+        """Update the device serial on a conversation after AI collects it."""
+        conv = await self.get_by_id(conversation_id)
+        if conv is None:
+            return
+        conv.device_serial = device_serial
+        conv.updated_at = datetime.now(timezone.utc)
+        await self.session.commit()

@@ -100,30 +100,6 @@ def get_kb_service(
     return KBService(embedding_service, kb_repository)
 
 
-def get_chat_service(
-    conversation_repository: ConversationRepository = Depends(get_conversation_repository),
-    kb_service: KBService = Depends(get_kb_service),
-    openai_client: AsyncOpenAI = Depends(get_openai_client),
-    settings: Settings = Depends(get_app_settings),
-) -> ChatService:
-    return ChatService(
-        conversation_repository,
-        kb_service,
-        openai_client,
-        settings.openai_chat_model,
-    )
-
-
-def get_chat_controller(chat_service: ChatService = Depends(get_chat_service)) -> ChatController:
-    return ChatController(chat_service)
-
-
-def get_conversation_controller(
-    conversation_repository: ConversationRepository = Depends(get_conversation_repository),
-) -> ConversationController:
-    return ConversationController(conversation_repository)
-
-
 def get_ticket_repository(
     request: Request,
     session: AsyncSession = Depends(get_supabase_session),
@@ -146,3 +122,29 @@ def get_ticket_controller(
     ticket_service: TicketService = Depends(get_ticket_service),
 ) -> TicketController:
     return TicketController(ticket_service)
+
+
+def get_chat_service(
+    conversation_repository: ConversationRepository = Depends(get_conversation_repository),
+    kb_service: KBService = Depends(get_kb_service),
+    openai_client: AsyncOpenAI = Depends(get_openai_client),
+    settings: Settings = Depends(get_app_settings),
+    ticket_service: TicketService = Depends(get_ticket_service),
+) -> ChatService:
+    return ChatService(
+        conversation_repository,
+        kb_service,
+        openai_client,
+        settings.openai_chat_model,
+        ticket_service,
+    )
+
+
+def get_chat_controller(chat_service: ChatService = Depends(get_chat_service)) -> ChatController:
+    return ChatController(chat_service)
+
+
+def get_conversation_controller(
+    conversation_repository: ConversationRepository = Depends(get_conversation_repository),
+) -> ConversationController:
+    return ConversationController(conversation_repository)

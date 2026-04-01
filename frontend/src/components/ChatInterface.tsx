@@ -457,11 +457,6 @@ export function ChatInterface({ onBack }: ChatInterfaceProps) {
               </div>
             ) : (
               <div className="max-w-[85%]">
-                {msg.confidence_tier === 'low' ? (
-                  <p className="text-xs italic text-amber-800 mb-1">
-                    ⚠ I&apos;m not fully certain about this
-                  </p>
-                ) : null}
                 <div className="bg-white border border-slate-200 text-slate-900 text-sm p-3.5 rounded-md rounded-tl-none shadow-sm leading-relaxed">
                   {msg.role === 'assistant' && msg.id === animatingMessageId ? (
                     <TypewriterText
