@@ -146,5 +146,6 @@ def get_chat_controller(chat_service: ChatService = Depends(get_chat_service)) -
 
 def get_conversation_controller(
     conversation_repository: ConversationRepository = Depends(get_conversation_repository),
+    settings: Settings = Depends(get_app_settings),
 ) -> ConversationController:
-    return ConversationController(conversation_repository)
+    return ConversationController(conversation_repository, settings)

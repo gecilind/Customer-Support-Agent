@@ -8,6 +8,26 @@ class ConversationResponse(BaseModel):
     created_at: datetime
 
 
+class ConversationListItem(BaseModel):
+    """One row for GET /conversations (list all)."""
+
+    id: str = Field(..., description="Conversation primary key as string")
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class ConversationDetailResponse(BaseModel):
+    """Metadata + optional Jira ticket for GET /conversations/{id}."""
+
+    id: str
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    jira_ticket_id: str | None = None
+    jira_ticket_url: str | None = None
+
+
 class MessageResponse(BaseModel):
     id: str = Field(..., description="Message primary key as string")
     conversation_id: str

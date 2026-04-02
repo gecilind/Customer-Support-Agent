@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.conversation import Conversation
 from models.message import Message
+from models.ticket import Ticket
 
 
 class ConversationRepository:
@@ -30,6 +31,21 @@ class ConversationRepository:
 
     async def get_by_id(self, conversation_id: int) -> Conversation | None:
         stmt = select(Conversation).where(Conversation.id == conversation_id)
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def list_all(self) -> Sequence[Conversation]:
+        stmt = select(Conversation).order_by(Conversation.created_at.desc())
+        result = await self.session.execute(stmt)
+        return result.scalars().all()
+
+    async def get_latest_jira_ticket_id(self, conversation_id: int) -> str | None:
+        stmt = (
+            select(Ticket.jira_ticket_id)
+            .where(Ticket.conversation_id == conversation_id)
+            .order_by(Ticket.created_at.desc())
+            .limit(1)
+        )
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
