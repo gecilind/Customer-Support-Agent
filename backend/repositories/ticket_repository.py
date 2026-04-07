@@ -24,6 +24,25 @@ def _severity_to_jira_priority(severity: str) -> str:
     return mapping.get(s, "Medium")
 
 
+def _jira_description_adf(request: TicketCreateRequest) -> dict[str, Any]:
+    content: list[dict[str, Any]] = [
+        {
+            "type": "paragraph",
+            "content": [{"type": "text", "text": request.description}],
+        }
+    ]
+    if request.device_serial is not None:
+        serial = request.device_serial.strip()
+        if serial:
+            content.append(
+                {
+                    "type": "paragraph",
+                    "content": [{"type": "text", "text": f"Device serial number: {serial}"}],
+                }
+            )
+    return {"type": "doc", "version": 1, "content": content}
+
+
 def _jira_issue_payload(request: TicketCreateRequest, settings: Settings) -> dict[str, Any]:
     return {
         "fields": {
@@ -31,16 +50,7 @@ def _jira_issue_payload(request: TicketCreateRequest, settings: Settings) -> dic
             "issuetype": {"name": "Task"},
             "priority": {"name": _severity_to_jira_priority(request.severity)},
             "summary": request.summary,
-            "description": {
-                "type": "doc",
-                "version": 1,
-                "content": [
-                    {
-                        "type": "paragraph",
-                        "content": [{"type": "text", "text": request.description}],
-                    }
-                ],
-            },
+            "description": _jira_description_adf(request),
             "labels": [request.issue_type],
         }
     }
