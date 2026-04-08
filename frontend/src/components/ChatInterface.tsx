@@ -392,7 +392,6 @@ export function ChatInterface({ onBack }: ChatInterfaceProps) {
                 <span className="w-1.5 h-1.5 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
                 <span className="w-1.5 h-1.5 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
               </span>
-              <span className="italic ml-1">Thinking...</span>
             </div>
           </div>
         ) : null}

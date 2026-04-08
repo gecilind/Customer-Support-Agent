@@ -1,5 +1,6 @@
 import logging
 import re
+import time
 
 from openai import AsyncOpenAI
 
@@ -7,11 +8,12 @@ from core.exceptions import IngestionError, JiraAPIError
 from repositories.conversation_repository import ConversationRepository
 from schemas.chat import ChatResponse
 from schemas.kb import KBSearchResult
-from schemas.ticket import TicketCreateRequest
+from schemas.ticket import TicketCreateRequest, TicketCreateResponse
 from services.kb_service import KBService
 from services.ticket_service import TicketService
 
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 SYSTEM_PROMPT = """You are the Infleet AI Support Agent — a professional, concise, and technically accurate support assistant specializing in Infleet GPS tracking hardware and software.
 
@@ -78,6 +80,9 @@ COLLECTION EFFICIENCY:
 - If the user describes obvious physical damage (cracked screen, shattered, fell, broken casing, water damage), do NOT ask "what have you tried" — physical damage has no troubleshooting. Move directly to ticket creation.
 - If the user sounds frustrated or has repeated their issue, stop asking and create the ticket immediately with the info you have.
 - If you already have 3 out of 4 required pieces of information, create the ticket. Do NOT delay for the last piece.
+
+LANGUAGE RULE:
+Never say "Let me create a support ticket" or "I will create a ticket" unless you are ACTUALLY creating the ticket in that same message (i.e., including the [CREATE_TICKET] block). If you still need to collect information, say "I need a few more details before I can help" — never promise ticket creation before it happens.
 
 TICKET CREATION SIGNAL:
 Once you have collected enough information to create a useful support ticket, respond with EXACTLY this format at the END of your message:
@@ -160,6 +165,7 @@ class ChatService:
         self.openai_client = openai_client
         self.openai_chat_model = openai_chat_model
         self.ticket_service = ticket_service
+        self._http_log: list[str] = []
 
     async def _history_openai_dicts(self, conversation_id: int) -> list[dict[str, str]]:
         """Fetch conversation history formatted for OpenAI messages array."""
@@ -188,6 +194,40 @@ class ChatService:
                 seen.add(key)
                 out.append(f"{c.source} — {c.section}")
         return out
+
+    def _log_chat_turn_block(
+        self,
+        message: str,
+        kb_query: str,
+        kb_results: list[KBSearchResult],
+        tier_label_log: str,
+        top_sim: float,
+        source_log: str,
+        ticket: TicketCreateResponse | None,
+        *,
+        http_calls: list[str],
+        elapsed: float,
+    ) -> None:
+        """Single structured info block per /chat request (end of turn)."""
+        kb_sim_line = (
+            " | ".join(f"{r.similarity:.3f}" for r in kb_results[:5])
+            if kb_results
+            else "no embeddings in database"
+        )
+        lines: list[str] = [
+            "════════════════════════════════════════════════════════════════════════════════",
+            *http_calls,
+            f'📩 User Message:     "{message}"',
+            f'🔄 Reformulated:     "{kb_query}"',
+            f"📊 KB Similarity:    {kb_sim_line}",
+            f"🎯 Confidence Tier:  {tier_label_log} (top={top_sim:.3f})",
+            f"📖 Source:           {source_log}",
+        ]
+        if ticket:
+            lines.append(f"🎫 Ticket Created:   {ticket.jira_ticket_id} ({ticket.jira_ticket_url})")
+        lines.append(f"⏱️ Response Time:    {elapsed:.2f}s")
+        lines.append("--------------------------------------------")
+        print("\n".join(lines))
 
     async def _reformulate_query(self, message: str, history: list[dict[str, str]]) -> str:
         """Condense a follow-up message into a standalone question using conversation history."""
@@ -277,16 +317,18 @@ class ChatService:
 
         return cleaned, data if data else None
 
-    async def _apply_ticket_flow(self, cid_int: int, user_email: str, ai_response: str) -> str:
+    async def _apply_ticket_flow(
+        self, cid_int: int, user_email: str, ai_response: str
+    ) -> tuple[str, TicketCreateResponse | None]:
         """Strip ticket block from AI text; if valid, create Jira ticket and append confirmation."""
         cleaned, ticket_data = self._parse_ticket_block(ai_response)
         if not ticket_data:
-            return ai_response
+            return ai_response, None
 
         required = ("issue_type", "severity", "summary", "description")
         if not all(ticket_data.get(k) for k in required):
             logger.warning("[CHAT] Ticket block present but missing required fields: %s", ticket_data)
-            return cleaned
+            return cleaned, None
 
         ds_raw = (ticket_data.get("device_serial") or "").strip()
         parsed_serial: str | None
@@ -297,7 +339,6 @@ class ChatService:
 
         issue_type = ticket_data["issue_type"].strip()
         severity = ticket_data["severity"].strip()
-        logger.info("[CHAT] Ticket creation triggered — issue_type=%s, severity=%s", issue_type, severity)
 
         try:
             ticket_request = TicketCreateRequest(
@@ -311,28 +352,36 @@ class ChatService:
             )
             ticket_response = await self.ticket_service.create_ticket(ticket_request)
         except JiraAPIError as exc:
-            logger.warning("[CHAT] Jira ticket creation failed: %s", exc)
-            return cleaned + (
-                "\n\nI attempted to create a support ticket but the ticketing system is temporarily unavailable. "
-                "Please contact Infleet support directly and reference this conversation."
+            logger.warning(
+                "[CHAT] Jira ticket creation failed (issue_type=%s, severity=%s): %s",
+                issue_type,
+                severity,
+                exc,
+            )
+            return (
+                cleaned
+                + (
+                    "\n\nI attempted to create a support ticket but the ticketing system is temporarily unavailable. "
+                    "Please contact Infleet support directly and reference this conversation."
+                ),
+                None,
             )
 
         if parsed_serial:
             await self.conversation_repository.update_device_serial(cid_int, parsed_serial)
 
         await self.conversation_repository.update_status(cid_int, "escalated")
-        logger.info(
-            "[CHAT] Ticket created — %s (%s)",
-            ticket_response.jira_ticket_id,
-            ticket_response.jira_ticket_url,
-        )
         return (
             cleaned
             + f"\n\nYour support ticket has been created. Ticket number: {ticket_response.jira_ticket_id}. "
-            + f"You can track it at: {ticket_response.jira_ticket_url}"
+            + f"You can track it at: {ticket_response.jira_ticket_url}",
+            ticket_response,
         )
 
     async def handle_message(self, message: str, conversation_id: str | None = None) -> ChatResponse:
+        self._http_log = []
+        start_time = time.perf_counter()
+
         # --- Resolve or create conversation ---
         if conversation_id is None:
             conv = await self.conversation_repository.create_conversation()
@@ -353,8 +402,6 @@ class ChatService:
             kb_query = await self._reformulate_query(message, history)
         else:
             kb_query = message
-        logger.info('[CHAT] Original: "%s"', message)
-        logger.info('[CHAT] Reformulated: "%s"', kb_query)
 
         # --- KB search (embedding uses reformulated query only) ---
         try:
@@ -376,12 +423,6 @@ class ChatService:
         else:
             confidence_tier = "low"
             tier_label_log = "LOW"
-
-        scores_formatted = (
-            ", ".join(f"{r.similarity:.3f}" for r in kb_results[:5])
-            if kb_results
-            else "no embeddings in database"
-        )
 
         # if confidence_tier in ("high", "low"):
         #     for i, r in enumerate(kb_results, start=1):
@@ -406,7 +447,9 @@ class ChatService:
             ai_response = await self._call_openai(openai_messages)
             sources: list[str] = []
 
-            final_response = await self._apply_ticket_flow(cid_int, conv.user_email, ai_response)
+            final_response, ticket_created = await self._apply_ticket_flow(
+                cid_int, conv.user_email, ai_response
+            )
 
             await self.conversation_repository.add_message(
                 cid_int, role="assistant", content=final_response, confidence_tier="none"
@@ -416,10 +459,18 @@ class ChatService:
                 "none — empty knowledge base" if no_results
                 else "none — responded via general knowledge"
             )
-            logger.info('[CHAT] Question: "%s"', message)
-            logger.info("[CHAT] KB Results: %s", scores_formatted)
-            logger.info("[CHAT] Confidence Tier: %s (top=%.3f)", tier_label_log, top_sim)
-            logger.info("[CHAT] Source: %s", source_log)
+            elapsed = time.perf_counter() - start_time
+            self._log_chat_turn_block(
+                message,
+                kb_query,
+                kb_results,
+                tier_label_log,
+                top_sim,
+                source_log,
+                ticket_created,
+                http_calls=list(self._http_log),
+                elapsed=elapsed,
+            )
 
             return ChatResponse(
                 conversation_id=str(cid_int),
@@ -452,7 +503,9 @@ class ChatService:
             {"role": "user", "content": kb_user_content},
         ]
         raw_ai = await self._call_openai(openai_messages)
-        ai_response = await self._apply_ticket_flow(cid_int, conv.user_email, raw_ai)
+        ai_response, ticket_created = await self._apply_ticket_flow(
+            cid_int, conv.user_email, raw_ai
+        )
 
         if confidence_tier == "low":
             await self.conversation_repository.add_message(
@@ -464,10 +517,18 @@ class ChatService:
             )
 
         source_log = f"{top.source} — Section: {top.section}"
-        logger.info('[CHAT] Question: "%s"', message)
-        logger.info("[CHAT] KB Results: %s", scores_formatted)
-        logger.info("[CHAT] Confidence Tier: %s (top=%.3f)", tier_label_log, top_sim)
-        logger.info("[CHAT] Source: %s", source_log)
+        elapsed = time.perf_counter() - start_time
+        self._log_chat_turn_block(
+            message,
+            kb_query,
+            kb_results,
+            tier_label_log,
+            top_sim,
+            source_log,
+            ticket_created,
+            http_calls=list(self._http_log),
+            elapsed=elapsed,
+        )
 
         return ChatResponse(
             conversation_id=str(cid_int),
