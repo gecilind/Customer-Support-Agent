@@ -201,6 +201,7 @@ User message → React frontend
   → Backend:
     1. Create or resolve conversation
     2. Save user message to DB
+    2a. If no prior user messages in history (first message), skip KB search — send system prompt + message directly to OpenAI. Greeting path only.
     3. Embed user question via text-embedding-3-small
     4. pgvector cosine similarity search against manuals table (top 5)
     5. Apply confidence tiers:
@@ -211,7 +212,13 @@ User message → React frontend
        - If escalation is needed and device identification is missing, the AI asks for the device serial number or vehicle name during conversation before creating a ticket
     7. Save assistant response to DB with confidence_tier
     8. Log: question, similarity scores, tier, source section
-    9. Return response to frontend
+    9. Stream response to frontend via SSE (text/event-stream):
+       - Yield "sources" event with KB source references
+       - Yield "chunk" events as OpenAI generates each token
+       - After stream ends: run ticket detection on accumulated response
+       - Save assistant message to DB
+       - Fire log block (KB times, OpenAI time, total response time)
+       - Yield "done" event with final message, confidence_tier, sources, and ticket data
 ```
 
 ### Escalation Path (Production — not in test env)
@@ -263,10 +270,30 @@ The AI operates under a detailed system prompt stored as `SYSTEM_PROMPT` in `cha
 
 All requests logged to terminal:
 ```
-[CHAT] Question: "{message}"
-[CHAT] KB Results: 0.783, 0.626, 0.623, 0.606, 0.598
-[CHAT] Confidence Tier: HIGH (top=0.783)
-[CHAT] Source: filename.pdf — Section: 2.1.2.1 Section Title
+════════════════════════════════════════════════════════════════════════════════
+📩 User Message:     "how to restore a licence"
+🔄 Reformulated:     "How can I restore a license?"
+📊 KB Similarity:    0.656 | 0.574 | 0.565 | 0.455 | 0.446
+🎯 Confidence Tier:  HIGH (top=0.656)
+📖 Source:           Public FAQ-v13-20240610_075228.pdf — Section: 3.3.2.2 How to restore a license
+🔍 KB Search Time:    1.36s
+🤖 OpenAI Time:    7.92s
+⏱️ Response Time:    11.81s
+--------------------------------------------
+```
+
+First-message skip (greeting path — no KB search):
+```
+════════════════════════════════════════════════════════════════════════════════
+📩 User Message:     "hello"
+🔄 Reformulated:     "hello"
+📊 KB Similarity:    skipped (first message)
+🎯 Confidence Tier:  NONE (top=0.000)
+📖 Source:           greeting — no KB search
+🔍 KB Search Time:    skipped
+🤖 OpenAI Time:    1.94s
+⏱️ Response Time:    4.29s
+--------------------------------------------
 ```
 
 ---
@@ -298,14 +325,16 @@ Rules:
 | ChatInterface | `ChatInterface.tsx` | Real-time chat with backend via fetch() |
 
 **ChatInterface behavior:**
-- On mount: `POST /conversations` → creates conversation → sends "hello" to get AI greeting
-- On submit: optimistic UI (show user message immediately) → `POST /chat` → append AI response
-- Typewriter animation on assistant messages (character by character reveal)
-- Auto-scroll on new messages
-- Loading indicator while waiting for AI
+- On mount: `POST /conversations` → creates conversation → `POST /chat` with `"hello"` via SSE stream → AI greeting streamed token by token
+- On submit: optimistic UI (show user message immediately) → `POST /chat` via SSE stream → tokens appear in real-time
+- SSE stream events: `sources` (KB sources), `chunk` (each token), `done` (final message with `confidence_tier` and ticket data)
+- Loading dots (pulsing) shown from message send until first `chunk` event arrives
+- Token buffer with 15–20 ms drain for smooth typing animation
+- `[CREATE_TICKET]` block hidden during streaming — replaced with "Creating support ticket…" spinner inside the message bubble, swapped for ticket confirmation on `done` event
+- Auto-scroll on new tokens
 - Confidence tier display: LOW shows warning label, NONE has muted indicator
 - Back button creates fresh conversation
-- Native `fetch()` only — no axios
+- Native `fetch()` + `ReadableStream` — no axios, no `EventSource`
 
 ---
 
@@ -372,13 +401,13 @@ Specifically:
 - NONE tier sends to OpenAI without context (handles greetings, thanks, off-topic naturally)
 - Frontend chat widget with typewriter animation, auto-scroll, loading states
 - Tested with a 9-section GPS manual and a 446-page CODESYS FAQ (657 chunks)
+- Jira ticket creation (`POST /create-ticket`) — working in production (tickets CSA-50 through CSA-54 created successfully)
+- Query reformulation — runs on every follow-up message when conversation has prior user history; skipped on first message
 
 ### Not Yet Built (Intentionally Skipped for Test Env)
 - User authentication (`window.__INFLEET_USER__`)
-- Jira ticket creation (`POST /create-ticket`)
 - Device identification happens during conversation (AI asks for device serial/vehicle name before ticket creation)
 - Voice path (Phase 2: `/voice-relay`, Realtime API, AudioWorklet)
-- Query reformulation (rewrite vague user messages using conversation context before KB search)
 - AI-guided clarification system (proactive narrowing of vague problems)
 
 ---

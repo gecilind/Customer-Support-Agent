@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 import time
@@ -6,7 +7,6 @@ from openai import AsyncOpenAI
 
 from core.exceptions import IngestionError, JiraAPIError
 from repositories.conversation_repository import ConversationRepository
-from schemas.chat import ChatResponse
 from schemas.kb import KBSearchResult
 from schemas.ticket import TicketCreateRequest, TicketCreateResponse
 from services.kb_service import KBService
@@ -151,6 +151,11 @@ Do NOT include explanations, steps, or troubleshooting advice.
 Output ONLY the rephrased standalone question in one sentence.
 If the follow-up is already a standalone question, return it as-is."""
 
+
+def _sse_event(data: dict) -> str:
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
 class ChatService:
     def __init__(
         self,
@@ -207,13 +212,19 @@ class ChatService:
         *,
         http_calls: list[str],
         elapsed: float,
+        kb_similarity_display: str | None = None,
+        kb_search_time_display: str = "skipped",
+        openai_elapsed: float = 0.0,
     ) -> None:
         """Single structured info block per /chat request (end of turn)."""
-        kb_sim_line = (
-            " | ".join(f"{r.similarity:.3f}" for r in kb_results[:5])
-            if kb_results
-            else "no embeddings in database"
-        )
+        if kb_similarity_display is not None:
+            kb_sim_line = kb_similarity_display
+        else:
+            kb_sim_line = (
+                " | ".join(f"{r.similarity:.3f}" for r in kb_results[:5])
+                if kb_results
+                else "no embeddings in database"
+            )
         lines: list[str] = [
             "════════════════════════════════════════════════════════════════════════════════",
             *http_calls,
@@ -225,6 +236,8 @@ class ChatService:
         ]
         if ticket:
             lines.append(f"🎫 Ticket Created:   {ticket.jira_ticket_id} ({ticket.jira_ticket_url})")
+        lines.append(f"🔍 KB Search Time:    {kb_search_time_display}")
+        lines.append(f"🤖 OpenAI Time:    {openai_elapsed:.2f}s")
         lines.append(f"⏱️ Response Time:    {elapsed:.2f}s")
         lines.append("--------------------------------------------")
         print("\n".join(lines))
@@ -283,6 +296,21 @@ class ChatService:
         )
         choice = response.choices[0].message
         return choice.content or ""
+
+    async def _call_openai_stream(self, messages: list[dict[str, str]]):
+        """Stream completion deltas from OpenAI (same model/limits as _call_openai)."""
+        stream = await self.openai_client.chat.completions.create(
+            model=self.openai_chat_model,
+            messages=messages,
+            max_tokens=500,
+            stream=True,
+        )
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if delta.content:
+                yield delta.content
 
     def _parse_ticket_block(self, text: str) -> tuple[str, dict[str, str] | None]:
         """Extract [CREATE_TICKET] block from AI response. Returns (cleaned_text, ticket_data or None)."""
@@ -378,42 +406,124 @@ class ChatService:
             ticket_response,
         )
 
-    async def handle_message(self, message: str, conversation_id: str | None = None) -> ChatResponse:
+    def _done_event_payload(
+        self,
+        *,
+        confidence_tier: str,
+        cid_int: int,
+        final_message: str,
+        sources: list[str],
+        ticket: TicketCreateResponse | None,
+    ) -> dict:
+        payload: dict = {
+            "type": "done",
+            "confidence_tier": confidence_tier,
+            "conversation_id": str(cid_int),
+            "message": final_message,
+            "sources": sources,
+            "ticket": None,
+        }
+        if ticket:
+            payload["ticket"] = {
+                "jira_ticket_id": ticket.jira_ticket_id,
+                "jira_ticket_url": ticket.jira_ticket_url,
+            }
+        return payload
+
+    async def handle_message_stream(self, message: str, conversation_id: str | None = None):
+        """SSE stream: sources → chunks → post-stream ticket/DB/log → done (or error)."""
         self._http_log = []
         start_time = time.perf_counter()
 
-        # --- Resolve or create conversation ---
-        if conversation_id is None:
-            conv = await self.conversation_repository.create_conversation()
-        else:
-            try:
-                cid = int(conversation_id)
-            except ValueError as exc:
-                raise ValueError("Invalid conversation_id") from exc
-            conv = await self.conversation_repository.get_by_id(cid)
-            if conv is None:
-                raise ValueError("Conversation not found")
+        try:
+            if conversation_id is None:
+                conv = await self.conversation_repository.create_conversation()
+            else:
+                try:
+                    cid = int(conversation_id)
+                except ValueError as exc:
+                    raise ValueError("Invalid conversation_id") from exc
+                conv = await self.conversation_repository.get_by_id(cid)
+                if conv is None:
+                    raise ValueError("Conversation not found")
+        except ValueError as exc:
+            yield _sse_event({"type": "error", "detail": str(exc)})
+            return
 
         cid_int = conv.id
         await self.conversation_repository.add_message(cid_int, role="user", content=message)
 
         history = await self._history_openai_dicts(cid_int)
-        if history:
+        has_user_history = any(m["role"] == "user" for m in history)
+        if has_user_history:
             kb_query = await self._reformulate_query(message, history)
         else:
             kb_query = message
 
+        # No prior user turns yet; skip KB — same as before.
+        if not has_user_history:
+            yield _sse_event({"type": "sources", "sources": []})
+            openai_messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": message},
+            ]
+            pieces: list[str] = []
+            openai_t0 = time.perf_counter()
+            try:
+                async for piece in self._call_openai_stream(openai_messages):
+                    pieces.append(piece)
+                    yield _sse_event({"type": "chunk", "content": piece})
+            except Exception:
+                logger.exception("[CHAT] OpenAI stream failed (early path)")
+                yield _sse_event({"type": "error", "detail": "Unable to complete chat request."})
+                return
+            openai_elapsed = time.perf_counter() - openai_t0
+            ai_raw = "".join(pieces)
+            final_response, ticket_created = await self._apply_ticket_flow(
+                cid_int, conv.user_email, ai_raw
+            )
+            await self.conversation_repository.add_message(
+                cid_int, role="assistant", content=final_response, confidence_tier="none"
+            )
+            elapsed = time.perf_counter() - start_time
+            self._log_chat_turn_block(
+                message,
+                kb_query,
+                [],
+                "NONE",
+                0.0,
+                "greeting — no KB search",
+                ticket_created,
+                http_calls=list(self._http_log),
+                elapsed=elapsed,
+                kb_similarity_display="skipped (first message)",
+                kb_search_time_display="skipped",
+                openai_elapsed=openai_elapsed,
+            )
+            yield _sse_event(
+                self._done_event_payload(
+                    confidence_tier="none",
+                    cid_int=cid_int,
+                    final_message=final_response,
+                    sources=[],
+                    ticket=ticket_created,
+                )
+            )
+            return
+
         # --- KB search (embedding uses reformulated query only) ---
+        kb_t0 = time.perf_counter()
         try:
             kb_results = await self.kb_service.search(kb_query)
         except IngestionError as exc:
             logger.warning("KB search failed (embedding): %s", exc)
             kb_results = []
+        kb_elapsed = time.perf_counter() - kb_t0
+        kb_search_time_display = f"{kb_elapsed:.2f}s"
 
         top_sim = kb_results[0].similarity if kb_results else 0.0
         no_results = len(kb_results) == 0
 
-        # --- Determine confidence tier ---
         if no_results or top_sim < TIER_LOW_MIN:
             confidence_tier = "none"
             tier_label_log = "NONE"
@@ -424,37 +534,32 @@ class ChatService:
             confidence_tier = "low"
             tier_label_log = "LOW"
 
-        # if confidence_tier in ("high", "low"):
-        #     for i, r in enumerate(kb_results, start=1):
-        #         preview = r.content[:80] if len(r.content) <= 80 else r.content[:80] + "..."
-        #         logger.info(
-        #             "[CHAT] Chunk %d: score=%.3f | source=%s | section=%s | content_preview=%s",
-        #             i,
-        #             r.similarity,
-        #             r.source,
-        #             r.section,
-        #             preview,
-        #         )
-        # --- Build OpenAI messages based on tier (history already loaded; uses original message) ---
-
         if confidence_tier == "none":
-            # No KB context — let the AI respond using system prompt + conversation history
+            sources: list[str] = []
+            yield _sse_event({"type": "sources", "sources": sources})
             openai_messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 *history,
                 {"role": "user", "content": message},
             ]
-            ai_response = await self._call_openai(openai_messages)
-            sources: list[str] = []
-
+            pieces = []
+            openai_t0 = time.perf_counter()
+            try:
+                async for piece in self._call_openai_stream(openai_messages):
+                    pieces.append(piece)
+                    yield _sse_event({"type": "chunk", "content": piece})
+            except Exception:
+                logger.exception("[CHAT] OpenAI stream failed (none tier)")
+                yield _sse_event({"type": "error", "detail": "Unable to complete chat request."})
+                return
+            openai_elapsed = time.perf_counter() - openai_t0
+            ai_raw = "".join(pieces)
             final_response, ticket_created = await self._apply_ticket_flow(
-                cid_int, conv.user_email, ai_response
+                cid_int, conv.user_email, ai_raw
             )
-
             await self.conversation_repository.add_message(
                 cid_int, role="assistant", content=final_response, confidence_tier="none"
             )
-
             source_log = (
                 "none — empty knowledge base" if no_results
                 else "none — responded via general knowledge"
@@ -470,20 +575,26 @@ class ChatService:
                 ticket_created,
                 http_calls=list(self._http_log),
                 elapsed=elapsed,
+                kb_search_time_display=kb_search_time_display,
+                openai_elapsed=openai_elapsed,
             )
-
-            return ChatResponse(
-                conversation_id=str(cid_int),
-                message=final_response,
-                confidence_tier=confidence_tier,
-                sources=sources,
+            yield _sse_event(
+                self._done_event_payload(
+                    confidence_tier=confidence_tier,
+                    cid_int=cid_int,
+                    final_message=final_response,
+                    sources=sources,
+                    ticket=ticket_created,
+                )
             )
+            return
 
-        # --- HIGH or LOW tier — build context and call OpenAI ---
         context_chunks = self._context_chunks(kb_results)
         context_str = self._context_string(context_chunks)
         sources = self._sources_from_chunks(context_chunks)
         top = kb_results[0]
+
+        yield _sse_event({"type": "sources", "sources": sources})
 
         kb_user_content = (
             f"Context from knowledge base:\n\n{context_str}\n\n"
@@ -502,9 +613,20 @@ class ChatService:
             *history,
             {"role": "user", "content": kb_user_content},
         ]
-        raw_ai = await self._call_openai(openai_messages)
+        pieces = []
+        openai_t0 = time.perf_counter()
+        try:
+            async for piece in self._call_openai_stream(openai_messages):
+                pieces.append(piece)
+                yield _sse_event({"type": "chunk", "content": piece})
+        except Exception:
+            logger.exception("[CHAT] OpenAI stream failed (rag path)")
+            yield _sse_event({"type": "error", "detail": "Unable to complete chat request."})
+            return
+        openai_elapsed = time.perf_counter() - openai_t0
+        ai_raw = "".join(pieces)
         ai_response, ticket_created = await self._apply_ticket_flow(
-            cid_int, conv.user_email, raw_ai
+            cid_int, conv.user_email, ai_raw
         )
 
         if confidence_tier == "low":
@@ -528,11 +650,15 @@ class ChatService:
             ticket_created,
             http_calls=list(self._http_log),
             elapsed=elapsed,
+            kb_search_time_display=kb_search_time_display,
+            openai_elapsed=openai_elapsed,
         )
-
-        return ChatResponse(
-            conversation_id=str(cid_int),
-            message=ai_response,
-            confidence_tier=confidence_tier,
-            sources=sources,
+        yield _sse_event(
+            self._done_event_payload(
+                confidence_tier=confidence_tier,
+                cid_int=cid_int,
+                final_message=ai_response,
+                sources=sources,
+                ticket=ticket_created,
+            )
         )
