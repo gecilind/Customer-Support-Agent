@@ -6,7 +6,7 @@ from fastapi import FastAPI
 
 logging.basicConfig(level=logging.INFO)
 
-from api.routers import chat_router, conversation_router, health_router, ingest_router, ticket_router
+from api.routers import chat_router, conversation_router, health_router, ingest_router, ticket_router, voice_router
 from db.supabase_pool import get_engine, get_session_factory
 from middleware.cors import register_cors
 from middleware.request_handler import request_handler_middleware
@@ -30,3 +30,4 @@ app.include_router(ingest_router.router)
 app.include_router(chat_router.router)
 app.include_router(conversation_router.router)
 app.include_router(ticket_router.router)
+app.include_router(voice_router.router)

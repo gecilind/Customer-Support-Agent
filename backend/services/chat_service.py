@@ -140,6 +140,13 @@ TIER_LOW_MIN = 0.40
 # Include KB chunks in RAG context when similarity meets the LOW tier floor.
 CONTEXT_CHUNK_MIN_SIMILARITY = TIER_LOW_MIN
 
+VOICE_MODE_INSTRUCTION = (
+    "VOICE MODE: The user is communicating via voice. Keep your response concise and conversational — "
+    "under 3-4 sentences when possible. Do NOT list 10 numbered steps. Summarize the key action briefly "
+    "and offer to provide more detail if needed. Speak naturally as if you are on a phone call, "
+    "not writing a document."
+)
+
 REFORMULATION_SYSTEM_PROMPT = """Given the following conversation and a follow-up input, rephrase the follow-up into a standalone question that can be understood without the conversation history.
 Do NOT answer the question.
 Do NOT include explanations, steps, or troubleshooting advice.
@@ -332,7 +339,7 @@ class ChatService:
             + f"You can track it at: {ticket_response.jira_ticket_url}"
         )
 
-    async def handle_message(self, message: str, conversation_id: str | None = None) -> ChatResponse:
+    async def handle_message(self, message: str, conversation_id: str | None = None, is_voice: bool = False) -> ChatResponse:
         # --- Resolve or create conversation ---
         if conversation_id is None:
             conv = await self.conversation_repository.create_conversation()
@@ -398,10 +405,11 @@ class ChatService:
 
         if confidence_tier == "none":
             # No KB context — let the AI respond using system prompt + conversation history
+            none_user_content = f"{VOICE_MODE_INSTRUCTION}\n\n{message}" if is_voice else message
             openai_messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 *history,
-                {"role": "user", "content": message},
+                {"role": "user", "content": none_user_content},
             ]
             ai_response = await self._call_openai(openai_messages)
             sources: list[str] = []
@@ -446,6 +454,8 @@ class ChatService:
             f"Do NOT respond with documentation disclaimers. If you have enough information, include the [CREATE_TICKET] block.\n\n"
             f"User question: {message}"
         )
+        if is_voice:
+            kb_user_content = f"{VOICE_MODE_INSTRUCTION}\n\n{kb_user_content}"
         openai_messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             *history,

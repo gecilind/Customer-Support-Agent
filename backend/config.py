@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     openai_chat_model: str = Field(default="gpt-4o-mini")
     # Declared so OPENAI_EMBEDDING_MODEL in .env validates; embedding calls stay hardcoded in EmbeddingService.
     openai_embedding_model: str = Field(default="text-embedding-3-small")
+    openai_realtime_model: str = Field(default="gpt-4o-realtime-preview")
 
     jira_base_url: str = Field(alias="JIRA_BASE_URL")
     jira_email: str = Field(alias="JIRA_EMAIL")
