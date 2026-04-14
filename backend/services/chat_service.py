@@ -7,6 +7,7 @@ from openai import AsyncOpenAI
 
 from core.exceptions import IngestionError, JiraAPIError
 from repositories.conversation_repository import ConversationRepository
+from schemas.chat import ChatResponse
 from schemas.kb import KBSearchResult
 from schemas.ticket import TicketCreateRequest, TicketCreateResponse
 from services.kb_service import KBService
@@ -437,7 +438,9 @@ class ChatService:
             }
         return payload
 
-    async def handle_message_stream(self, message: str, conversation_id: str | None = None):
+    async def handle_message_stream(
+        self, message: str, conversation_id: str | None = None, *, is_voice: bool = False
+    ):
         """SSE stream: sources → chunks → post-stream ticket/DB/log → done (or error)."""
         self._http_log = []
         start_time = time.perf_counter()
@@ -470,9 +473,10 @@ class ChatService:
         # No prior user turns yet; skip KB — same as before.
         if not has_user_history:
             yield _sse_event({"type": "sources", "sources": []})
+            greeting_user = f"{VOICE_MODE_INSTRUCTION}\n\n{message}" if is_voice else message
             openai_messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": message},
+                {"role": "user", "content": greeting_user},
             ]
             pieces: list[str] = []
             openai_t0 = time.perf_counter()
@@ -544,6 +548,7 @@ class ChatService:
         if confidence_tier == "none":
             sources: list[str] = []
             yield _sse_event({"type": "sources", "sources": sources})
+            none_user_content = f"{VOICE_MODE_INSTRUCTION}\n\n{message}" if is_voice else message
             openai_messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 *history,
@@ -670,4 +675,35 @@ class ChatService:
                 sources=sources,
                 ticket=ticket_created,
             )
+        )
+
+    async def handle_message(
+        self,
+        message: str,
+        conversation_id: str | None = None,
+        *,
+        is_voice: bool = False,
+    ) -> ChatResponse:
+        """Voice relay: run the same pipeline as SSE, return the terminal `done` payload as JSON."""
+        done: dict | None = None
+        async for raw in self.handle_message_stream(message, conversation_id, is_voice=is_voice):
+            block = raw.strip()
+            if not block:
+                continue
+            first_line = block.splitlines()[0]
+            if not first_line.startswith("data:"):
+                continue
+            payload = json.loads(first_line.removeprefix("data:").strip())
+            if payload.get("type") == "error":
+                raise ValueError(str(payload.get("detail", "Chat error")))
+            if payload.get("type") == "done":
+                done = payload
+                break
+        if done is None:
+            raise RuntimeError("Chat stream ended without a done event")
+        return ChatResponse(
+            conversation_id=str(done["conversation_id"]),
+            message=str(done["message"]),
+            confidence_tier=str(done["confidence_tier"]),
+            sources=list(done.get("sources") or []),
         )
