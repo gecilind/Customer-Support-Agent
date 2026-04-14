@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import re
+import time
 
 import websockets
 from fastapi import WebSocket, WebSocketDisconnect
@@ -17,11 +18,19 @@ OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?model={model}"
 # It is NOT used for AI reasoning — our chat_service handles that.
 _RELAY_INSTRUCTIONS = (
     "You are a voice relay. When asked to say something, repeat it exactly as given, "
-    "word for word, without any additions, omissions, or changes."
+    "word for word, without any additions, omissions, or changes. "
+    "Always speak in English regardless of the input language or accent."
 )
 
 # Regex: transcript is noise if it consists only of whitespace or punctuation
 _NOISE_PATTERN = re.compile(r"^[\s.,!?;:\u2026\-\u2014\u2013\u00b7\*]+$")
+
+# Realtime PCM16 output is mono; match frontend playback rate for drain timing.
+_TTS_OUTPUT_SAMPLE_RATE = 24_000
+# Minimum post-audio.done wait (covers scheduling / jitter).
+_PLAYBACK_DRAIN_MIN_S = 0.8
+# Extra slack after estimated PCM duration so UI stays "speaking" until playback likely finished.
+_PLAYBACK_DRAIN_PAD_S = 0.35
 
 
 class VoiceService:
@@ -69,10 +78,17 @@ class VoiceService:
                 # 2. Shared mutable state (single asyncio thread — no locks needed)
                 state: dict = {
                     "conversation_id": None,
-                    # True while we are cancelling the auto-generated AI response
-                    # so stale audio.delta events are discarded.
                     "cancelling": False,
+                    "is_speaking": False,
+                    "tts_pcm_bytes": 0,
                 }
+
+                try:
+                    await browser_ws.send_text(
+                        json.dumps({"type": "state", "state": "listening"})
+                    )
+                except Exception:
+                    pass
 
                 # 3. Get initial greeting from chat_service → TTS it
                 await self._send_initial_greeting(browser_ws, openai_ws, state)
@@ -105,7 +121,7 @@ class VoiceService:
             "type": "session.update",
             "session": {
                 "modalities": ["text", "audio"],
-                "voice": "nova",
+                "voice": "ash",
                 "instructions": _RELAY_INSTRUCTIONS,
                 "turn_detection": {
                     "type": "server_vad",
@@ -117,6 +133,7 @@ class VoiceService:
                 "output_audio_format": "pcm16",
                 "input_audio_transcription": {
                     "model": "whisper-1",
+                    "language": "en",
                 },
             },
         }))
@@ -152,8 +169,7 @@ class VoiceService:
             )
             state["conversation_id"] = response.conversation_id
 
-            await browser_ws.send_text(json.dumps({"type": "state", "state": "speaking"}))
-            await self._trigger_tts(openai_ws, response.message)
+            await self._trigger_tts(openai_ws, response.message, state)
 
         except Exception as exc:
             logger.warning("[VOICE] Greeting failed: %s", exc)
@@ -164,7 +180,7 @@ class VoiceService:
     # TTS helper
     # ------------------------------------------------------------------
 
-    async def _trigger_tts(self, openai_ws, text: str) -> None:
+    async def _trigger_tts(self, openai_ws, text: str, state: dict) -> None:
         """
         Ask the Realtime API to speak `text` verbatim.
 
@@ -172,6 +188,7 @@ class VoiceService:
         instructions that contain the text to speak. This bypasses the
         Realtime model's own reasoning and uses it purely as a TTS engine.
         """
+        state["tts_pcm_bytes"] = 0
         await openai_ws.send(json.dumps({
             "type": "response.create",
             "response": {
@@ -230,11 +247,12 @@ class VoiceService:
         """
         Handle all events from the Realtime API:
         - audio.delta  → relay PCM16 bytes to browser
-        - audio.done   → notify browser that AI finished speaking
-        - transcription.completed → STT failsafe → chat_service → TTS
-        - speech_started → set browser to listening state
+        - response.audio.done → drain (min + estimated PCM play time), then "listening"
+        - input_audio_buffer.speech_started → state "listening" (when not speaking)
+        - transcription.completed → chat_service → TTS
         """
         try:
+            last_speech_started: float = 0.0
             async for raw in openai_ws:
                 evt = json.loads(raw)
                 etype = evt.get("type")
@@ -245,15 +263,40 @@ class VoiceService:
                         continue
                     audio_b64 = evt.get("delta", "")
                     if audio_b64:
+                        if not state["is_speaking"]:
+                            state["is_speaking"] = True
+                            state["tts_pcm_bytes"] = 0
+                            try:
+                                await browser_ws.send_text(
+                                    json.dumps({"type": "state", "state": "speaking"})
+                                )
+                            except Exception:
+                                return
                         audio_bytes = base64.b64decode(audio_b64)
+                        state["tts_pcm_bytes"] = state.get("tts_pcm_bytes", 0) + len(
+                            audio_bytes
+                        )
                         try:
                             await browser_ws.send_bytes(audio_bytes)
                         except Exception:
                             return
 
-                # ── AI finished speaking ────────────────────────────────
+                # ── Audio stream finished → transition to listening ────
                 elif etype == "response.audio.done":
                     if not state["cancelling"]:
+                        pcm_bytes = max(0, state.get("tts_pcm_bytes", 0))
+                        est_playback_s = (pcm_bytes / 2) / _TTS_OUTPUT_SAMPLE_RATE
+                        drain_s = max(
+                            _PLAYBACK_DRAIN_MIN_S,
+                            est_playback_s + _PLAYBACK_DRAIN_PAD_S,
+                        )
+                        # Keep is_speaking True until after drain so echo VAD cannot
+                        # push "listening" while the browser is still playing queued PCM.
+                        await asyncio.sleep(drain_s)
+                        if state["cancelling"]:
+                            continue
+                        state["is_speaking"] = False
+                        state["tts_pcm_bytes"] = 0
                         try:
                             await browser_ws.send_text(
                                 json.dumps({"type": "state", "state": "listening"})
@@ -261,9 +304,20 @@ class VoiceService:
                         except Exception:
                             return
 
-                # ── Cancelled response fully settled ────────────────────
                 elif etype == "response.done":
                     state["cancelling"] = False
+
+                # ── User started speaking ───────────────────────────────
+                elif etype == "input_audio_buffer.speech_started":
+                    now = time.monotonic()
+                    if not state.get("is_speaking", False) and (now - last_speech_started) > 1.0:
+                        last_speech_started = now
+                        try:
+                            await browser_ws.send_text(
+                                json.dumps({"type": "state", "state": "listening"})
+                            )
+                        except Exception:
+                            return
 
                 # ── User speech transcribed ─────────────────────────────
                 elif etype == "conversation.item.input_audio_transcription.completed":
@@ -276,7 +330,6 @@ class VoiceService:
 
                     logger.info("[VOICE] Transcript: %r", transcript)
 
-                    # Mark as cancelling so stale audio.delta events are dropped
                     state["cancelling"] = True
                     try:
                         await browser_ws.send_text(
@@ -285,9 +338,7 @@ class VoiceService:
                     except Exception:
                         return
 
-                    # Cancel the Realtime API's auto-generated response
                     await openai_ws.send(json.dumps({"type": "response.cancel"}))
-                    # Brief yield so the cancel can propagate before we create a new response
                     await asyncio.sleep(0.05)
 
                     # ── Call our AI pipeline ────────────────────────────
@@ -307,22 +358,7 @@ class VoiceService:
 
                     # ── Trigger TTS of our response ─────────────────────
                     state["cancelling"] = False
-                    try:
-                        await browser_ws.send_text(
-                            json.dumps({"type": "state", "state": "speaking"})
-                        )
-                        await self._trigger_tts(openai_ws, response_text)
-                    except Exception:
-                        return
-
-                # ── User started speaking ───────────────────────────────
-                elif etype == "input_audio_buffer.speech_started":
-                    try:
-                        await browser_ws.send_text(
-                            json.dumps({"type": "state", "state": "listening"})
-                        )
-                    except Exception:
-                        return
+                    await self._trigger_tts(openai_ws, response_text, state)
 
                 # ── Log Realtime API errors ─────────────────────────────
                 elif etype == "error":

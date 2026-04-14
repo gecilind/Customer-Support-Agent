@@ -35,6 +35,7 @@ function pcm16BytesToFloat32(buffer: ArrayBuffer): Float32Array {
 export function VoiceInterface({ onBack }: Props) {
   const [voiceState, setVoiceState] = useState<VoiceState>('connecting');
   const [errorMsg, setErrorMsg] = useState<string>('');
+  const stateRef = useRef<VoiceState>('connecting');
 
   // Refs so closures in event handlers always see current values
   const wsRef = useRef<WebSocket | null>(null);
@@ -50,12 +51,15 @@ export function VoiceInterface({ onBack }: Props) {
   const playAudioChunk = useCallback((bytes: ArrayBuffer) => {
     const ctx = audioCtxRef.current;
     if (!ctx) return;
+    if (ctx.state === 'suspended') {
+      void ctx.resume();
+    }
 
     const float32 = pcm16BytesToFloat32(bytes);
     // Create a buffer at the TTS output rate (OpenAI Realtime API: 24 kHz).
     // The AudioContext will automatically resample to its own output rate.
     const audioBuf = ctx.createBuffer(1, float32.length, 24_000);
-    audioBuf.copyToChannel(float32, 0);
+    audioBuf.getChannelData(0).set(float32);
 
     const source = ctx.createBufferSource();
     source.buffer = audioBuf;
@@ -106,8 +110,55 @@ export function VoiceInterface({ onBack }: Props) {
       // 2. Create AudioContext
       const ctx = new AudioContext();
       audioCtxRef.current = ctx;
+      // Browsers start AudioContext suspended until resumed (autoplay policy).
+      try {
+        await ctx.resume();
+      } catch {
+        /* ignore */
+      }
 
-      // 3. Load the PCM worklet
+      // 3. Open WebSocket early so backend state frames are not missed while worklet loads.
+      const base = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/+$/, '');
+      const wsUrl = `${base.replace(/^http/, 'ws')}/voice-relay`;
+      const ws = new WebSocket(wsUrl);
+      ws.binaryType = 'arraybuffer';
+      wsRef.current = ws;
+
+      ws.onmessage = (evt: MessageEvent) => {
+        if (typeof evt.data === 'string') {
+          try {
+            const msg = JSON.parse(evt.data) as { type: string; state?: VoiceState; message?: string };
+            if (msg.type === 'state' && msg.state) {
+              if (!cancelled) {
+                setVoiceState(msg.state);
+                stateRef.current = msg.state;
+              }
+            } else if (msg.type === 'error') {
+              if (!cancelled) {
+                setErrorMsg(msg.message ?? 'An error occurred.');
+                setVoiceState('error');
+              }
+            }
+          } catch { /* non-JSON text, ignore */ }
+        } else if (evt.data instanceof ArrayBuffer && evt.data.byteLength > 0) {
+          playAudioChunk(evt.data);
+        }
+      };
+
+      ws.onerror = () => {
+        if (!cancelled) {
+          setErrorMsg('Connection to voice service failed.');
+          setVoiceState('error');
+        }
+      };
+
+      ws.onclose = () => {
+        if (!cancelled && voiceState !== 'error') {
+          // Backend closed — silently return to selection
+        }
+      };
+
+      // 4. Load the PCM worklet
       try {
         // Vite serves the TypeScript source at its URL during dev;
         // in production the file is compiled and content-hashed.
@@ -140,63 +191,18 @@ export function VoiceInterface({ onBack }: Props) {
 
       if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return; }
 
-      // 4. Wire mic → worklet
+      // 5. Wire mic → worklet
       const source = ctx.createMediaStreamSource(stream);
       const workletNode = new AudioWorkletNode(ctx, 'pcm-processor');
       workletNodeRef.current = workletNode;
       source.connect(workletNode);
       // No output: worklet posts messages; we don't route audio to speakers
 
-      // 5. Open WebSocket to /voice-relay
-      const base = import.meta.env.VITE_API_URL || 'http://localhost:8000';
-      const wsUrl = base.replace(/^http/, 'ws') + '/voice-relay';
-      const ws = new WebSocket(wsUrl);
-      ws.binaryType = 'arraybuffer';
-      wsRef.current = ws;
-
       // 6. Forward PCM16 frames from worklet to WebSocket
       workletNode.port.onmessage = (evt: MessageEvent<ArrayBuffer>) => {
-        if (ws.readyState === WebSocket.OPEN) {
+        if (ws.readyState === WebSocket.OPEN && stateRef.current === 'listening') {
           ws.send(evt.data);
         }
-      };
-
-      // 7. Handle messages from backend
-      ws.onmessage = (evt: MessageEvent) => {
-        if (typeof evt.data === 'string') {
-          // State / control message
-          try {
-            const msg = JSON.parse(evt.data) as { type: string; state?: VoiceState; message?: string };
-            if (msg.type === 'state' && msg.state) {
-              if (!cancelled) setVoiceState(msg.state);
-            } else if (msg.type === 'error') {
-              if (!cancelled) {
-                setErrorMsg(msg.message ?? 'An error occurred.');
-                setVoiceState('error');
-              }
-            }
-          } catch { /* non-JSON text, ignore */ }
-        } else if (evt.data instanceof ArrayBuffer && evt.data.byteLength > 0) {
-          // PCM16 audio from AI
-          playAudioChunk(evt.data);
-        }
-      };
-
-      ws.onerror = () => {
-        if (!cancelled) {
-          setErrorMsg('Connection to voice service failed.');
-          setVoiceState('error');
-        }
-      };
-
-      ws.onclose = () => {
-        if (!cancelled && voiceState !== 'error') {
-          // Backend closed — silently return to selection
-        }
-      };
-
-      ws.onopen = () => {
-        // Backend will send the initial greeting and a state='speaking' message
       };
     };
 

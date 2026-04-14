@@ -150,7 +150,12 @@ VOICE_MODE_INSTRUCTION = (
     "VOICE MODE: The user is communicating via voice. Keep your response concise and conversational — "
     "under 3-4 sentences when possible. Do NOT list 10 numbered steps. Summarize the key action briefly "
     "and offer to provide more detail if needed. Speak naturally as if you are on a phone call, "
-    "not writing a document."
+    "not writing a document.\n\n"
+    "IMPORTANT: The escalation and ticket creation rules from the system prompt still apply fully in voice mode. "
+    "If the issue cannot be resolved from the knowledge base, collect the required information "
+    "(device serial, what happened, when it started, what they tried) across multiple turns exactly as you would in text mode. "
+    "Do NOT skip information collection. Do NOT avoid emitting the [CREATE_TICKET] block. "
+    "Keep each collection question short and conversational, but do not omit the flow."
 )
 
 REFORMULATION_SYSTEM_PROMPT = """Given the following conversation and a follow-up input, rephrase the follow-up into a standalone question that can be understood without the conversation history.
