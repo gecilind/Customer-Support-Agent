@@ -11,6 +11,26 @@ interface Props {
   onBack: () => void;
 }
 
+/** Browser console: same prefix as backend logs for cross-checking sync. */
+function clientVoiceSync(
+  sessionT0Ms: { current: number },
+  event: string,
+  extra?: Record<string, unknown>,
+) {
+  if (!sessionT0Ms.current) sessionT0Ms.current = performance.now();
+  const elapsed_ms = Math.round((performance.now() - sessionT0Ms.current) * 100) / 100;
+  console.info(
+    '[VOICE_SYNC]',
+    JSON.stringify({
+      layer: 'frontend',
+      event,
+      elapsed_ms,
+      wall_ts_ms: Date.now(),
+      ...extra,
+    }),
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Audio helpers
 // ---------------------------------------------------------------------------
@@ -44,11 +64,18 @@ export function VoiceInterface({ onBack }: Props) {
   const micStreamRef = useRef<MediaStream | null>(null);
   // Tracks the next time we should schedule audio playback to avoid gaps
   const nextPlayTimeRef = useRef<number>(0);
+  const voiceSessionT0Ref = useRef<number>(0);
+  const playbackPendingRef = useRef(0);
 
   // ------------------------------------------------------------------
   // Playback: schedule a PCM16 chunk as an AudioBufferSourceNode
   // ------------------------------------------------------------------
   const playAudioChunk = useCallback((bytes: ArrayBuffer) => {
+    // Half-duplex: do not play assistant audio unless UI is in speaking (server sends
+    // state before PCM; drops stray chunks if state desynced).
+    if (stateRef.current !== 'speaking') {
+      return;
+    }
     const ctx = audioCtxRef.current;
     if (!ctx) return;
     if (ctx.state === 'suspended') {
@@ -69,6 +96,25 @@ export function VoiceInterface({ onBack }: Props) {
     const startAt = Math.max(now, nextPlayTimeRef.current);
     source.start(startAt);
     nextPlayTimeRef.current = startAt + audioBuf.duration;
+
+    playbackPendingRef.current += 1;
+    const pendingAfter = playbackPendingRef.current;
+    if (pendingAfter === 1) {
+      clientVoiceSync(voiceSessionT0Ref, 'user_listening_playback_first_chunk', {
+        samples: float32.length,
+        scheduled_end_audio_time: startAt + audioBuf.duration,
+        ui_state: stateRef.current,
+      });
+    }
+    source.onended = () => {
+      playbackPendingRef.current -= 1;
+      if (playbackPendingRef.current <= 0) {
+        playbackPendingRef.current = 0;
+        clientVoiceSync(voiceSessionT0Ref, 'user_listening_playback_queue_empty', {
+          ui_state: stateRef.current,
+        });
+      }
+    };
   }, []);
 
   // ------------------------------------------------------------------
@@ -124,14 +170,51 @@ export function VoiceInterface({ onBack }: Props) {
       ws.binaryType = 'arraybuffer';
       wsRef.current = ws;
 
+      ws.onopen = () => {
+        voiceSessionT0Ref.current = performance.now();
+        nextPlayTimeRef.current = 0;
+        playbackPendingRef.current = 0;
+        clientVoiceSync(voiceSessionT0Ref, 'client_ws_open', { url: wsUrl });
+      };
+
       ws.onmessage = (evt: MessageEvent) => {
         if (typeof evt.data === 'string') {
           try {
-            const msg = JSON.parse(evt.data) as { type: string; state?: VoiceState; message?: string };
+            const msg = JSON.parse(evt.data) as {
+              type: string;
+              state?: VoiceState;
+              message?: string;
+              event?: string;
+              elapsed_ms?: number;
+              wall_ts_ms?: number;
+            };
+            if (msg.type === 'voice_sync' && msg.event) {
+              console.info(
+                '[VOICE_SYNC]',
+                JSON.stringify({
+                  layer: 'frontend',
+                  source: 'ws_relay',
+                  event: msg.event,
+                  elapsed_ms: msg.elapsed_ms,
+                  wall_ts_ms: msg.wall_ts_ms,
+                  ...Object.fromEntries(
+                    Object.entries(msg).filter(
+                      ([k]) => !['type', 'event', 'elapsed_ms', 'wall_ts_ms'].includes(k),
+                    ),
+                  ),
+                }),
+              );
+              return;
+            }
             if (msg.type === 'state' && msg.state) {
               if (!cancelled) {
-                setVoiceState(msg.state);
-                stateRef.current = msg.state;
+                const prev = stateRef.current;
+                const next = msg.state;
+                if (prev !== next) {
+                  clientVoiceSync(voiceSessionT0Ref, 'ui_state_transition', { from: prev, to: next });
+                }
+                setVoiceState(next);
+                stateRef.current = next;
               }
             } else if (msg.type === 'error') {
               if (!cancelled) {
@@ -198,11 +281,17 @@ export function VoiceInterface({ onBack }: Props) {
       source.connect(workletNode);
       // No output: worklet posts messages; we don't route audio to speakers
 
-      // 6. Forward PCM16 frames from worklet to WebSocket
+      // 6. Forward PCM16 frames from worklet → WebSocket only in true "user may talk" window:
+      //    half-duplex — not while assistant audio is playing locally (avoids echo / VAD junk).
       workletNode.port.onmessage = (evt: MessageEvent<ArrayBuffer>) => {
-        if (ws.readyState === WebSocket.OPEN && stateRef.current === 'listening') {
-          ws.send(evt.data);
-        }
+        if (ws.readyState !== WebSocket.OPEN) return;
+        if (stateRef.current !== 'listening') return;
+        const ctxMic = audioCtxRef.current;
+        const tailDone =
+          playbackPendingRef.current === 0 &&
+          (!ctxMic || ctxMic.currentTime >= nextPlayTimeRef.current - 0.04);
+        if (!tailDone) return;
+        ws.send(evt.data);
       };
     };
 
@@ -219,7 +308,10 @@ export function VoiceInterface({ onBack }: Props) {
   // Visual state rendering helpers
   // ------------------------------------------------------------------
 
-  const stateConfig: Record<VoiceState, { label: string; color: string; icon: React.ReactNode }> = {
+  const stateConfig: Record<
+    VoiceState,
+    { label: string; color: string; icon: React.ReactNode; hint?: string }
+  > = {
     connecting: {
       label: 'Connecting…',
       color: 'text-slate-500',
@@ -247,10 +339,12 @@ export function VoiceInterface({ onBack }: Props) {
           <Loader2 size={36} className="animate-spin" strokeWidth={2} />
         </div>
       ),
+      hint: 'Heard you — fetching context and drafting a reply. Mic is off until the assistant speaks.',
     },
     speaking: {
       label: 'AI Speaking',
       color: 'text-blue-600',
+      hint: 'Your mic is off until playback ends and the screen returns to Listening.',
       icon: (
         <div className="relative flex items-center justify-center">
           <div className="p-5 rounded-full bg-blue-50 text-blue-600">
@@ -317,6 +411,9 @@ export function VoiceInterface({ onBack }: Props) {
         {/* State label */}
         <div className="text-center">
           <p className={`text-lg font-semibold ${cfg.color}`}>{cfg.label}</p>
+          {cfg.hint && (
+            <p className="text-xs text-slate-500 mt-1 max-w-[280px] mx-auto leading-snug">{cfg.hint}</p>
+          )}
           {voiceState === 'listening' && (
             <p className="text-xs text-slate-400 mt-1">Speak now — AI will respond when you pause</p>
           )}

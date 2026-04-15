@@ -33,6 +33,31 @@ _PLAYBACK_DRAIN_MIN_S = 0.8
 _PLAYBACK_DRAIN_PAD_S = 0.35
 
 
+async def _voice_sync(browser_ws: WebSocket, state: dict, event: str, **fields: object) -> None:
+    """
+    Structured sync log (server console) + same payload to the browser as type \"voice_sync\"
+    so frontend logs can be aligned by wall_ts_ms / elapsed_ms with backend.
+    """
+    t0 = state.get("_sync_t0")
+    if t0 is None:
+        t0 = time.perf_counter()
+        state["_sync_t0"] = t0
+    elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+    wall_ts_ms = int(time.time() * 1000)
+    payload: dict = {
+        "type": "voice_sync",
+        "event": event,
+        "elapsed_ms": elapsed_ms,
+        "wall_ts_ms": wall_ts_ms,
+        **fields,
+    }
+    logger.info("[VOICE_SYNC] %s", json.dumps(payload, default=str))
+    try:
+        await browser_ws.send_text(json.dumps(payload, default=str))
+    except Exception:
+        pass
+
+
 class VoiceService:
     """
     Manages a single voice session:
@@ -81,11 +106,20 @@ class VoiceService:
                     "cancelling": False,
                     "is_speaking": False,
                     "tts_pcm_bytes": 0,
+                    # True after response.create until response.done (covers gaps between audio segments).
+                    "tts_response_in_flight": False,
                 }
+                state["_sync_t0"] = time.perf_counter()
 
                 try:
                     await browser_ws.send_text(
                         json.dumps({"type": "state", "state": "listening"})
+                    )
+                    await _voice_sync(
+                        browser_ws,
+                        state,
+                        "ai_listening_start",
+                        phase="initial_connect",
                     )
                 except Exception:
                     pass
@@ -174,7 +208,17 @@ class VoiceService:
         except Exception as exc:
             logger.warning("[VOICE] Greeting failed: %s", exc)
             # Let the user start the conversation themselves
-            await browser_ws.send_text(json.dumps({"type": "state", "state": "listening"}))
+            try:
+                await browser_ws.send_text(json.dumps({"type": "state", "state": "listening"}))
+                await _voice_sync(
+                    browser_ws,
+                    state,
+                    "ai_listening_start",
+                    phase="greeting_failed",
+                    detail=str(exc),
+                )
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # TTS helper
@@ -189,6 +233,7 @@ class VoiceService:
         Realtime model's own reasoning and uses it purely as a TTS engine.
         """
         state["tts_pcm_bytes"] = 0
+        state["tts_response_in_flight"] = True
         await openai_ws.send(json.dumps({
             "type": "response.create",
             "response": {
@@ -266,6 +311,18 @@ class VoiceService:
                         if not state["is_speaking"]:
                             state["is_speaking"] = True
                             state["tts_pcm_bytes"] = 0
+                            await _voice_sync(
+                                browser_ws,
+                                state,
+                                "ai_speaking_start",
+                                note="first_tts_audio_delta",
+                            )
+                            await _voice_sync(
+                                browser_ws,
+                                state,
+                                "user_listening_start",
+                                note="relay_first_pcm_to_browser",
+                            )
                             try:
                                 await browser_ws.send_text(
                                     json.dumps({"type": "state", "state": "speaking"})
@@ -290,31 +347,71 @@ class VoiceService:
                             _PLAYBACK_DRAIN_MIN_S,
                             est_playback_s + _PLAYBACK_DRAIN_PAD_S,
                         )
+                        await _voice_sync(
+                            browser_ws,
+                            state,
+                            "ai_speaking_server_segment_done",
+                            pcm_bytes=pcm_bytes,
+                            est_playback_s=round(est_playback_s, 4),
+                            drain_s=round(drain_s, 4),
+                        )
                         # Keep is_speaking True until after drain so echo VAD cannot
                         # push "listening" while the browser is still playing queued PCM.
                         await asyncio.sleep(drain_s)
                         if state["cancelling"]:
                             continue
+                        await _voice_sync(
+                            browser_ws,
+                            state,
+                            "ai_speaking_end",
+                            note="after_playback_drain",
+                        )
+                        await _voice_sync(
+                            browser_ws,
+                            state,
+                            "user_listening_end",
+                            note="relay_drain_complete",
+                        )
                         state["is_speaking"] = False
                         state["tts_pcm_bytes"] = 0
                         try:
                             await browser_ws.send_text(
                                 json.dumps({"type": "state", "state": "listening"})
                             )
+                            await _voice_sync(
+                                browser_ws,
+                                state,
+                                "ai_listening_start",
+                                phase="awaiting_user_after_assistant",
+                            )
                         except Exception:
                             return
 
                 elif etype == "response.done":
                     state["cancelling"] = False
+                    state["tts_response_in_flight"] = False
 
                 # ── User started speaking ───────────────────────────────
                 elif etype == "input_audio_buffer.speech_started":
+                    await _voice_sync(
+                        browser_ws,
+                        state,
+                        "user_speaking_start",
+                        assistant_audio_playing=bool(state.get("is_speaking")),
+                        note="openai_vad_speech_started",
+                    )
                     now = time.monotonic()
                     if not state.get("is_speaking", False) and (now - last_speech_started) > 1.0:
                         last_speech_started = now
                         try:
                             await browser_ws.send_text(
                                 json.dumps({"type": "state", "state": "listening"})
+                            )
+                            await _voice_sync(
+                                browser_ws,
+                                state,
+                                "ai_listening_ui_signal",
+                                reason="vad_speech_started_debounced",
                             )
                         except Exception:
                             return
@@ -330,16 +427,37 @@ class VoiceService:
 
                     logger.info("[VOICE] Transcript: %r", transcript)
 
+                    await _voice_sync(
+                        browser_ws,
+                        state,
+                        "user_speaking_end",
+                        transcript_preview=transcript[:80],
+                        transcript_len=len(transcript),
+                    )
+                    await _voice_sync(
+                        browser_ws,
+                        state,
+                        "ai_listening_end",
+                        reason="utterance_transcribed",
+                    )
+
                     state["cancelling"] = True
                     try:
                         await browser_ws.send_text(
                             json.dumps({"type": "state", "state": "processing"})
                         )
+                        await _voice_sync(
+                            browser_ws,
+                            state,
+                            "assistant_processing_start",
+                            note="chat_pipeline_running",
+                        )
                     except Exception:
                         return
 
-                    await openai_ws.send(json.dumps({"type": "response.cancel"}))
-                    await asyncio.sleep(0.05)
+                    if state.get("tts_response_in_flight") or state.get("is_speaking"):
+                        await openai_ws.send(json.dumps({"type": "response.cancel"}))
+                        await asyncio.sleep(0.05)
 
                     # ── Call our AI pipeline ────────────────────────────
                     try:
@@ -356,13 +474,24 @@ class VoiceService:
                             "I'm sorry, I encountered an error. Please try again."
                         )
 
+                    await _voice_sync(
+                        browser_ws,
+                        state,
+                        "assistant_processing_end",
+                        note="chat_pipeline_done_before_tts",
+                    )
+
                     # ── Trigger TTS of our response ─────────────────────
                     state["cancelling"] = False
                     await self._trigger_tts(openai_ws, response_text, state)
 
                 # ── Log Realtime API errors ─────────────────────────────
                 elif etype == "error":
-                    logger.error("[VOICE] Realtime API error: %s", evt)
+                    err = evt.get("error") or {}
+                    if err.get("code") == "response_cancel_not_active":
+                        logger.debug("[VOICE] Realtime API (benign): %s", evt)
+                    else:
+                        logger.error("[VOICE] Realtime API error: %s", evt)
 
         except Exception as exc:
             logger.error("[VOICE] openai_to_browser error: %s", exc)
