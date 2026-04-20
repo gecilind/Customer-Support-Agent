@@ -706,9 +706,16 @@ class ChatService:
                 break
         if done is None:
             raise RuntimeError("Chat stream ended without a done event")
+        ticket_data = done.get("ticket")
+        jira_ticket_url: str | None = None
+        if isinstance(ticket_data, dict):
+            raw_url = ticket_data.get("jira_ticket_url")
+            if isinstance(raw_url, str) and raw_url.strip():
+                jira_ticket_url = raw_url.strip()
         return ChatResponse(
             conversation_id=str(done["conversation_id"]),
             message=str(done["message"]),
             confidence_tier=str(done["confidence_tier"]),
             sources=list(done.get("sources") or []),
+            jira_ticket_url=jira_ticket_url,
         )

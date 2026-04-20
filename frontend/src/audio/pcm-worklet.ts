@@ -11,17 +11,31 @@
  * posts each processed block as an ArrayBuffer to the main thread via
  * this.port.postMessage().
  *
- * The main thread forwards these buffers as binary WebSocket frames to
- * the backend /voice-relay endpoint.
+ * When muted, process() returns without sending PCM (hard gate — zero bytes leave).
  */
 class PCMProcessor extends AudioWorkletProcessor {
   private readonly targetRate = 16_000;
+
+  private muted = true;
+
+  constructor() {
+    super();
+    this.port.onmessage = (e: MessageEvent) => {
+      if (e.data?.type === 'set_muted') {
+        this.muted = Boolean(e.data.value);
+      }
+    };
+  }
 
   process(
     inputs: Float32Array[][],
     _outputs: Float32Array[][],
     _parameters: Record<string, Float32Array>,
   ): boolean {
+    if (this.muted) {
+      return true;
+    }
+
     const channel = inputs[0]?.[0];
     if (!channel || channel.length === 0) return true;
 

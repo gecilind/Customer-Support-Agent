@@ -5,40 +5,36 @@ import { ArrowLeft, Mic, Loader2, PhoneOff, Volume2 } from 'lucide-react';
 // Types
 // ---------------------------------------------------------------------------
 
-type VoiceState = 'connecting' | 'listening' | 'processing' | 'speaking' | 'error';
+type VoiceMode = 'listening' | 'processing' | 'speaking';
+type VoiceState = 'connecting' | VoiceMode | 'error';
+
+interface TranscriptEntry {
+  role: 'user' | 'assistant';
+  text: string;
+  ticketUrl?: string;
+}
 
 interface Props {
   onBack: () => void;
 }
 
-/** Browser console: same prefix as backend logs for cross-checking sync. */
-function clientVoiceSync(
-  sessionT0Ms: { current: number },
-  event: string,
-  extra?: Record<string, unknown>,
-) {
-  if (!sessionT0Ms.current) sessionT0Ms.current = performance.now();
-  const elapsed_ms = Math.round((performance.now() - sessionT0Ms.current) * 100) / 100;
-  console.info(
-    '[VOICE_SYNC]',
-    JSON.stringify({
-      layer: 'frontend',
-      event,
-      elapsed_ms,
-      wall_ts_ms: Date.now(),
-      ...extra,
-    }),
-  );
+function formatPlaybackTs(): string {
+  const d = new Date();
+  const pad = (n: number) => n.toString().padStart(2, '0');
+  const ms = d.getMilliseconds().toString().padStart(3, '0');
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${ms}`;
+}
+
+function applyWorkletMute(worklet: AudioWorkletNode | null, mode: VoiceMode | 'connecting') {
+  if (!worklet) return;
+  const muted = mode !== 'listening';
+  worklet.port.postMessage({ type: 'set_muted', value: muted });
 }
 
 // ---------------------------------------------------------------------------
 // Audio helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Convert PCM16 little-endian bytes (OpenAI TTS output at 24 kHz) to a
- * Float32Array so we can feed it into an AudioBufferSourceNode.
- */
 function pcm16BytesToFloat32(buffer: ArrayBuffer): Float32Array {
   const int16 = new Int16Array(buffer);
   const float32 = new Float32Array(int16.length);
@@ -55,76 +51,79 @@ function pcm16BytesToFloat32(buffer: ArrayBuffer): Float32Array {
 export function VoiceInterface({ onBack }: Props) {
   const [voiceState, setVoiceState] = useState<VoiceState>('connecting');
   const [errorMsg, setErrorMsg] = useState<string>('');
-  const stateRef = useRef<VoiceState>('connecting');
+  const [transcripts, setTranscripts] = useState<TranscriptEntry[]>([]);
 
-  // Refs so closures in event handlers always see current values
   const wsRef = useRef<WebSocket | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
-  // Tracks the next time we should schedule audio playback to avoid gaps
   const nextPlayTimeRef = useRef<number>(0);
-  const voiceSessionT0Ref = useRef<number>(0);
   const playbackPendingRef = useRef(0);
+  const ttsStreamEndedRef = useRef(false);
+  const activePlaybackSourcesRef = useRef<AudioBufferSourceNode[]>([]);
 
-  // ------------------------------------------------------------------
-  // Playback: schedule a PCM16 chunk as an AudioBufferSourceNode
-  // ------------------------------------------------------------------
-  const playAudioChunk = useCallback((bytes: ArrayBuffer) => {
-    // Half-duplex: do not play assistant audio unless UI is in speaking (server sends
-    // state before PCM; drops stray chunks if state desynced).
-    if (stateRef.current !== 'speaking') {
-      return;
-    }
-    const ctx = audioCtxRef.current;
-    if (!ctx) return;
-    if (ctx.state === 'suspended') {
-      void ctx.resume();
-    }
+  const listeningStartTsRef = useRef<string>('');
+  const mutedStartTsRef = useRef<string>('');
 
-    const float32 = pcm16BytesToFloat32(bytes);
-    // Create a buffer at the TTS output rate (OpenAI Realtime API: 24 kHz).
-    // The AudioContext will automatically resample to its own output rate.
-    const audioBuf = ctx.createBuffer(1, float32.length, 24_000);
-    audioBuf.getChannelData(0).set(float32);
-
-    const source = ctx.createBufferSource();
-    source.buffer = audioBuf;
-    source.connect(ctx.destination);
-
-    const now = ctx.currentTime;
-    const startAt = Math.max(now, nextPlayTimeRef.current);
-    source.start(startAt);
-    nextPlayTimeRef.current = startAt + audioBuf.duration;
-
-    playbackPendingRef.current += 1;
-    const pendingAfter = playbackPendingRef.current;
-    if (pendingAfter === 1) {
-      clientVoiceSync(voiceSessionT0Ref, 'user_listening_playback_first_chunk', {
-        samples: float32.length,
-        scheduled_end_audio_time: startAt + audioBuf.duration,
-        ui_state: stateRef.current,
-      });
-    }
-    source.onended = () => {
-      playbackPendingRef.current -= 1;
-      if (playbackPendingRef.current <= 0) {
-        playbackPendingRef.current = 0;
-        clientVoiceSync(voiceSessionT0Ref, 'user_listening_playback_queue_empty', {
-          ui_state: stateRef.current,
-        });
-      }
-    };
+  const trySendPlaybackDrained = useCallback(() => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (playbackPendingRef.current !== 0 || !ttsStreamEndedRef.current) return;
+    ttsStreamEndedRef.current = false;
+    ws.send(JSON.stringify({ type: 'playback_drained', ts: formatPlaybackTs() }));
   }, []);
 
-  // ------------------------------------------------------------------
-  // Tear-down: close WebSocket + stop mic + suspend audio context
-  // ------------------------------------------------------------------
+  const playAudioChunk = useCallback(
+    (bytes: ArrayBuffer) => {
+      const ctx = audioCtxRef.current;
+      if (!ctx) return;
+      if (ctx.state === 'suspended') {
+        void ctx.resume();
+      }
+
+      const float32 = pcm16BytesToFloat32(bytes);
+      const audioBuf = ctx.createBuffer(1, float32.length, 24_000);
+      audioBuf.getChannelData(0).set(float32);
+
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuf;
+      source.playbackRate.value = 1.1; // was 1.15
+      source.connect(ctx.destination);
+
+      const now = ctx.currentTime;
+      const startAt = Math.max(now, nextPlayTimeRef.current);
+      source.start(startAt);
+      nextPlayTimeRef.current = startAt + audioBuf.duration / source.playbackRate.value;
+
+      playbackPendingRef.current += 1;
+      activePlaybackSourcesRef.current.push(source);
+      source.onended = () => {
+        activePlaybackSourcesRef.current = activePlaybackSourcesRef.current.filter((n) => n !== source);
+        playbackPendingRef.current -= 1;
+        if (playbackPendingRef.current <= 0) {
+          playbackPendingRef.current = 0;
+        }
+        trySendPlaybackDrained();
+      };
+    },
+    [trySendPlaybackDrained],
+  );
+
   const teardown = useCallback(() => {
-    try { wsRef.current?.close(); } catch { /* ignore */ }
-    try { workletNodeRef.current?.disconnect(); } catch { /* ignore */ }
+    try {
+      wsRef.current?.close();
+    } catch {
+      /* ignore */
+    }
+    try {
+      workletNodeRef.current?.disconnect();
+    } catch {
+      /* ignore */
+    }
     micStreamRef.current?.getTracks().forEach((t) => t.stop());
-    audioCtxRef.current?.suspend().catch(() => { /* ignore */ });
+    audioCtxRef.current?.suspend().catch(() => {
+      /* ignore */
+    });
   }, []);
 
   const handleBack = useCallback(() => {
@@ -132,14 +131,10 @@ export function VoiceInterface({ onBack }: Props) {
     onBack();
   }, [teardown, onBack]);
 
-  // ------------------------------------------------------------------
-  // Main setup: mic → worklet → WebSocket  +  WebSocket → speaker
-  // ------------------------------------------------------------------
   useEffect(() => {
     let cancelled = false;
 
     const setup = async () => {
-      // 1. Request microphone permission
       let stream: MediaStream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
@@ -150,108 +145,35 @@ export function VoiceInterface({ onBack }: Props) {
         }
         return;
       }
-      if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return; }
+      if (cancelled) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
       micStreamRef.current = stream;
 
-      // 2. Create AudioContext
       const ctx = new AudioContext();
       audioCtxRef.current = ctx;
-      // Browsers start AudioContext suspended until resumed (autoplay policy).
       try {
         await ctx.resume();
       } catch {
         /* ignore */
       }
 
-      // 3. Open WebSocket early so backend state frames are not missed while worklet loads.
-      const base = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/+$/, '');
-      const wsUrl = `${base.replace(/^http/, 'ws')}/voice-relay`;
-      const ws = new WebSocket(wsUrl);
-      ws.binaryType = 'arraybuffer';
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        voiceSessionT0Ref.current = performance.now();
-        nextPlayTimeRef.current = 0;
-        playbackPendingRef.current = 0;
-        clientVoiceSync(voiceSessionT0Ref, 'client_ws_open', { url: wsUrl });
-      };
-
-      ws.onmessage = (evt: MessageEvent) => {
-        if (typeof evt.data === 'string') {
-          try {
-            const msg = JSON.parse(evt.data) as {
-              type: string;
-              state?: VoiceState;
-              message?: string;
-              event?: string;
-              elapsed_ms?: number;
-              wall_ts_ms?: number;
-            };
-            if (msg.type === 'voice_sync' && msg.event) {
-              console.info(
-                '[VOICE_SYNC]',
-                JSON.stringify({
-                  layer: 'frontend',
-                  source: 'ws_relay',
-                  event: msg.event,
-                  elapsed_ms: msg.elapsed_ms,
-                  wall_ts_ms: msg.wall_ts_ms,
-                  ...Object.fromEntries(
-                    Object.entries(msg).filter(
-                      ([k]) => !['type', 'event', 'elapsed_ms', 'wall_ts_ms'].includes(k),
-                    ),
-                  ),
-                }),
-              );
-              return;
-            }
-            if (msg.type === 'state' && msg.state) {
-              if (!cancelled) {
-                const prev = stateRef.current;
-                const next = msg.state;
-                if (prev !== next) {
-                  clientVoiceSync(voiceSessionT0Ref, 'ui_state_transition', { from: prev, to: next });
-                }
-                setVoiceState(next);
-                stateRef.current = next;
-              }
-            } else if (msg.type === 'error') {
-              if (!cancelled) {
-                setErrorMsg(msg.message ?? 'An error occurred.');
-                setVoiceState('error');
-              }
-            }
-          } catch { /* non-JSON text, ignore */ }
-        } else if (evt.data instanceof ArrayBuffer && evt.data.byteLength > 0) {
-          playAudioChunk(evt.data);
-        }
-      };
-
-      ws.onerror = () => {
-        if (!cancelled) {
-          setErrorMsg('Connection to voice service failed.');
-          setVoiceState('error');
-        }
-      };
-
-      ws.onclose = () => {
-        if (!cancelled && voiceState !== 'error') {
-          // Backend closed — silently return to selection
-        }
-      };
-
-      // 4. Load the PCM worklet
       try {
-        // Vite serves the TypeScript source at its URL during dev;
-        // in production the file is compiled and content-hashed.
         const workletUrl = new URL('../audio/pcm-worklet.ts', import.meta.url);
         await ctx.audioWorklet.addModule(workletUrl);
       } catch {
-        // Fallback: inline blob worklet (works when Vite ?url isn't available)
         const code = `
           class PCMProcessor extends AudioWorkletProcessor {
+            constructor() {
+              super();
+              this.muted = true;
+              this.port.onmessage = (e) => {
+                if (e.data?.type === 'set_muted') this.muted = Boolean(e.data.value);
+              };
+            }
             process(inputs) {
+              if (this.muted) return true;
               const ch = inputs[0]?.[0];
               if (!ch || !ch.length) return true;
               const ratio = sampleRate / 16000;
@@ -272,26 +194,141 @@ export function VoiceInterface({ onBack }: Props) {
         await ctx.audioWorklet.addModule(URL.createObjectURL(blob));
       }
 
-      if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return; }
+      if (cancelled) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
 
-      // 5. Wire mic → worklet
       const source = ctx.createMediaStreamSource(stream);
       const workletNode = new AudioWorkletNode(ctx, 'pcm-processor');
       workletNodeRef.current = workletNode;
       source.connect(workletNode);
-      // No output: worklet posts messages; we don't route audio to speakers
+      applyWorkletMute(workletNode, 'connecting');
 
-      // 6. Forward PCM16 frames from worklet → WebSocket only in true "user may talk" window:
-      //    half-duplex — not while assistant audio is playing locally (avoids echo / VAD junk).
-      workletNode.port.onmessage = (evt: MessageEvent<ArrayBuffer>) => {
+      const base = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/+$/, '');
+      const wsUrl = `${base.replace(/^http/, 'ws')}/voice-relay`;
+      const ws = new WebSocket(wsUrl);
+      ws.binaryType = 'arraybuffer';
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        nextPlayTimeRef.current = 0;
+        playbackPendingRef.current = 0;
+        ttsStreamEndedRef.current = false;
+      };
+
+      ws.onmessage = (evt: MessageEvent) => {
+        if (typeof evt.data === 'string') {
+          try {
+            const msg = JSON.parse(evt.data) as {
+              type: string;
+              mode?: VoiceMode;
+              ts?: string;
+              message?: string;
+              role?: 'user' | 'assistant';
+              text?: string;
+              url?: string;
+              conversation_id?: string;
+            };
+
+            if (msg.type === 'transcript' && msg.role && msg.text) {
+              if (!cancelled) {
+                setTranscripts((prev) => [...prev, { role: msg.role!, text: msg.text! }]);
+              }
+              return;
+            }
+
+            if (msg.type === 'ticket_created' && msg.url) {
+              if (!cancelled) {
+                setTranscripts((prev) => {
+                  const next = [...prev];
+                  if (next.length && next[next.length - 1].role === 'assistant') {
+                    next[next.length - 1] = {
+                      ...next[next.length - 1],
+                      ticketUrl: msg.url,
+                    };
+                  }
+                  return next;
+                });
+              }
+              return;
+            }
+
+            if (msg.type === 'flush_audio') {
+              const ctxFlush = audioCtxRef.current;
+              if (ctxFlush) {
+                nextPlayTimeRef.current = ctxFlush.currentTime;
+              }
+              for (const s of activePlaybackSourcesRef.current) {
+                try {
+                  s.stop(0);
+                } catch {
+                  /* already stopped */
+                }
+              }
+              activePlaybackSourcesRef.current = [];
+              playbackPendingRef.current = 0;
+              ttsStreamEndedRef.current = true;
+              trySendPlaybackDrained();
+              return;
+            }
+
+            if (msg.type === 'mode_start' && msg.mode && msg.ts) {
+              if (cancelled) return;
+              setVoiceState(msg.mode);
+              if (msg.mode === 'listening') {
+                listeningStartTsRef.current = msg.ts;
+                applyWorkletMute(workletNodeRef.current, 'listening');
+              } else if (msg.mode === 'processing') {
+                mutedStartTsRef.current = msg.ts;
+                applyWorkletMute(workletNodeRef.current, 'processing');
+              } else if (msg.mode === 'speaking') {
+                applyWorkletMute(workletNodeRef.current, 'speaking');
+              }
+              return;
+            }
+
+            if (msg.type === 'mode_end' && msg.mode && msg.ts) {
+              if (msg.mode === 'listening') {
+                console.info(
+                  `Mic: UNMUTED   Start: ${listeningStartTsRef.current}   End: ${msg.ts}`,
+                );
+              } else if (msg.mode === 'speaking') {
+                console.info(`Mic: MUTED     Start: ${mutedStartTsRef.current}   End: ${msg.ts}`);
+              }
+              return;
+            }
+
+            if (msg.type === 'tts_stream_ended') {
+              ttsStreamEndedRef.current = true;
+              trySendPlaybackDrained();
+              return;
+            }
+
+            if (msg.type === 'error') {
+              if (!cancelled) {
+                setErrorMsg(msg.message ?? 'An error occurred.');
+                setVoiceState('error');
+              }
+            }
+          } catch {
+            /* non-JSON */
+          }
+        } else if (evt.data instanceof ArrayBuffer && evt.data.byteLength > 0) {
+          playAudioChunk(evt.data);
+        }
+      };
+
+      ws.onerror = () => {
+        if (!cancelled) {
+          setErrorMsg('Connection to voice service failed.');
+          setVoiceState('error');
+        }
+      };
+
+      workletNode.port.onmessage = (e: MessageEvent<ArrayBuffer>) => {
         if (ws.readyState !== WebSocket.OPEN) return;
-        if (stateRef.current !== 'listening') return;
-        const ctxMic = audioCtxRef.current;
-        const tailDone =
-          playbackPendingRef.current === 0 &&
-          (!ctxMic || ctxMic.currentTime >= nextPlayTimeRef.current - 0.04);
-        if (!tailDone) return;
-        ws.send(evt.data);
+        ws.send(e.data);
       };
     };
 
@@ -303,10 +340,6 @@ export function VoiceInterface({ onBack }: Props) {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  // ------------------------------------------------------------------
-  // Visual state rendering helpers
-  // ------------------------------------------------------------------
 
   const stateConfig: Record<
     VoiceState,
@@ -322,7 +355,6 @@ export function VoiceInterface({ onBack }: Props) {
       color: 'text-emerald-600',
       icon: (
         <div className="relative flex items-center justify-center">
-          {/* Pulsing rings */}
           <span className="absolute inline-flex h-24 w-24 rounded-full bg-emerald-100 opacity-75 animate-ping" />
           <span className="absolute inline-flex h-20 w-20 rounded-full bg-emerald-50 opacity-50 animate-ping [animation-delay:0.3s]" />
           <div className="relative z-10 p-5 rounded-full bg-emerald-100 text-emerald-700">
@@ -350,7 +382,6 @@ export function VoiceInterface({ onBack }: Props) {
           <div className="p-5 rounded-full bg-blue-50 text-blue-600">
             <Volume2 size={36} strokeWidth={2} />
           </div>
-          {/* Animated sound bars */}
           <div className="absolute -bottom-6 flex items-end gap-1">
             {[12, 20, 16, 24, 14, 20, 10].map((h, i) => (
               <div
@@ -380,12 +411,8 @@ export function VoiceInterface({ onBack }: Props) {
 
   const cfg = stateConfig[voiceState];
 
-  // ------------------------------------------------------------------
-  // Render
-  // ------------------------------------------------------------------
   return (
     <div className="flex flex-col h-full bg-white animate-in fade-in duration-300">
-      {/* Header */}
       <div className="flex items-center gap-3 px-4 py-3 border-b border-slate-200 shrink-0">
         <button
           type="button"
@@ -401,39 +428,62 @@ export function VoiceInterface({ onBack }: Props) {
         </div>
       </div>
 
-      {/* Main area */}
-      <div className="flex flex-col flex-1 items-center justify-center gap-10 px-8">
-        {/* Animated icon */}
-        <div className="flex items-center justify-center min-h-[100px]">
-          {cfg.icon}
+      <div className="flex flex-col flex-1 min-h-0">
+        <div className="flex flex-col flex-1 items-center justify-center gap-10 px-8 overflow-y-auto">
+          <div className="flex items-center justify-center min-h-[100px]">{cfg.icon}</div>
+
+          <div className="text-center">
+            <p className={`text-lg font-semibold ${cfg.color}`}>{cfg.label}</p>
+            {cfg.hint && (
+              <p className="text-xs text-slate-500 mt-1 max-w-[280px] mx-auto leading-snug">{cfg.hint}</p>
+            )}
+            {voiceState === 'listening' && (
+              <p className="text-xs text-slate-400 mt-1">Speak now — AI will respond when you pause</p>
+            )}
+            {voiceState === 'error' && (
+              <p className="text-xs text-red-500 mt-1 max-w-[260px] text-center">{errorMsg}</p>
+            )}
+          </div>
+
+          {voiceState !== 'error' && voiceState !== 'connecting' && (
+            <p className="text-[11px] text-slate-400 text-center max-w-[220px]">
+              Half-duplex mode — AI responds after each pause
+            </p>
+          )}
         </div>
 
-        {/* State label */}
-        <div className="text-center">
-          <p className={`text-lg font-semibold ${cfg.color}`}>{cfg.label}</p>
-          {cfg.hint && (
-            <p className="text-xs text-slate-500 mt-1 max-w-[280px] mx-auto leading-snug">{cfg.hint}</p>
-          )}
-          {voiceState === 'listening' && (
-            <p className="text-xs text-slate-400 mt-1">Speak now — AI will respond when you pause</p>
-          )}
-          {voiceState === 'error' && (
-            <p className="text-xs text-red-500 mt-1 max-w-[260px] text-center">{errorMsg}</p>
-          )}
-        </div>
-
-        {/* Instruction / hint */}
-        {voiceState !== 'error' && voiceState !== 'connecting' && (
-          <p className="text-[11px] text-slate-400 text-center max-w-[220px]">
-            Half-duplex mode — AI responds after each pause
-          </p>
+        {transcripts.length > 0 && (
+          <div className="w-full max-h-[200px] overflow-y-auto px-4 py-3 border-t border-slate-200 space-y-2 shrink-0">
+            {transcripts.map((t, i) => (
+              <div
+                key={i}
+                className={`text-xs px-3 py-2 rounded-lg max-w-[85%] ${
+                  t.role === 'user'
+                    ? 'ml-auto bg-blue-50 text-blue-900'
+                    : 'mr-auto bg-slate-100 text-slate-900'
+                }`}
+              >
+                <p>{t.text}</p>
+                {t.ticketUrl && (
+                  <a
+                    href={t.ticketUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="block mt-1 text-[10px] font-semibold text-blue-700 underline"
+                  >
+                    View ticket: {t.ticketUrl.split('/').pop()}
+                  </a>
+                )}
+              </div>
+            ))}
+          </div>
         )}
 
         {voiceState !== 'error' && (
           <button
             type="button"
             onClick={handleBack}
-            className="mt-2 inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium rounded-sm border border-red-200 bg-red-50 text-red-900 hover:bg-red-100 transition-colors focus:outline-none focus:ring-2 focus:ring-red-800 focus:ring-offset-2"
+            className="mt-auto shrink-0 m-4 inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium rounded-sm border border-red-200 bg-red-50 text-red-900 hover:bg-red-100 transition-colors focus:outline-none focus:ring-2 focus:ring-red-800 focus:ring-offset-2 self-center"
             aria-label="End voice conversation and disconnect"
           >
             <PhoneOff size={18} strokeWidth={2} aria-hidden />

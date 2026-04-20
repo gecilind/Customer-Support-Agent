@@ -1,10 +1,9 @@
 from fastapi import APIRouter, Depends
-from starlette.responses import StreamingResponse
 
 from api.controllers.chat_controller import ChatController
 from api.dependencies import get_chat_controller
 from schemas.chat import ChatRequest
-
+from starlette.responses import StreamingResponse
 
 router = APIRouter(tags=["chat"])
 
