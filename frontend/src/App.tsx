@@ -2,8 +2,9 @@ import React, { useState } from 'react';
 import { SelectionScreen } from './components/SelectionScreen';
 import { ChatInterface } from './components/ChatInterface';
 import { ChatHistory } from './components/ChatHistory';
+import { VoiceInterface } from './components/VoiceInterface';
 
-type ScreenState = 'selection' | 'chat' | 'history';
+type ScreenState = 'selection' | 'chat' | 'history' | 'voice';
 
 export function App() {
   const [currentScreen, setCurrentScreen] = useState<ScreenState>('selection');
@@ -24,7 +25,10 @@ export function App() {
               setHistoryConversationId(id);
               setCurrentScreen('history');
             }}
+            onSelectVoice={() => setCurrentScreen('voice')}
           />
+        ) : currentScreen === 'voice' ? (
+          <VoiceInterface onBack={() => setCurrentScreen('selection')} />
         ) : currentScreen === 'chat' ? (
           <ChatInterface onBack={() => setCurrentScreen('selection')} />
         ) : historyConversationId !== null ? (

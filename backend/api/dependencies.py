@@ -1,8 +1,9 @@
 from collections.abc import AsyncGenerator
 
-from fastapi import Depends, Request
+from fastapi import Depends
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.requests import HTTPConnection
 
 from openai import AsyncOpenAI
 
@@ -12,6 +13,7 @@ from api.controllers.health_controller import HealthController
 from api.controllers.ingest_controller import IngestController
 from api.controllers.manual_controller import ManualController
 from api.controllers.ticket_controller import TicketController
+from api.controllers.voice_controller import VoiceController
 from config import Settings, get_settings
 from repositories.conversation_repository import ConversationRepository
 from repositories.health_repository import HealthRepository
@@ -25,13 +27,14 @@ from services.ingestion_service import IngestionService
 from services.kb_service import KBService
 from services.manual_service import ManualService
 from services.ticket_service import TicketService
+from services.voice_service import VoiceService
 
 
 def get_app_settings() -> Settings:
     return get_settings()
 
 
-def get_supabase_session_factory(request: Request) -> async_sessionmaker[AsyncSession]:
+def get_supabase_session_factory(request: HTTPConnection) -> async_sessionmaker[AsyncSession]:
     return request.app.state.db_session_factory
 
 
@@ -101,7 +104,7 @@ def get_kb_service(
 
 
 def get_ticket_repository(
-    request: Request,
+    request: HTTPConnection,
     session: AsyncSession = Depends(get_supabase_session),
     settings: Settings = Depends(get_app_settings),
 ) -> TicketRepository:
@@ -149,3 +152,20 @@ def get_conversation_controller(
     settings: Settings = Depends(get_app_settings),
 ) -> ConversationController:
     return ConversationController(conversation_repository, settings)
+
+
+def get_voice_service(
+    chat_service: ChatService = Depends(get_chat_service),
+    settings: Settings = Depends(get_app_settings),
+) -> VoiceService:
+    return VoiceService(
+        chat_service=chat_service,
+        openai_api_key=settings.openai_api_key,
+        realtime_model=settings.openai_realtime_model,
+    )
+
+
+def get_voice_controller(
+    voice_service: VoiceService = Depends(get_voice_service),
+) -> VoiceController:
+    return VoiceController(voice_service)

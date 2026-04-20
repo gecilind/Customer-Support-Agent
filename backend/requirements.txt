@@ -10,5 +10,6 @@ python-dotenv
 python-multipart
 openai
 httpx
+websockets>=12
 pypdf
 pymupdf
