@@ -9,14 +9,18 @@ from pydantic_settings.sources import (
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     supabase_db_url: str = Field(alias="SUPABASE_DB_URL")
     openai_api_key: str = Field(alias="OPENAI_KEY")
-    openai_chat_model: str = Field(default="gpt-4o-mini")
+    openai_chat_model: str = Field(default="OPENAI_CHAT_MODEL")
     # Declared so OPENAI_EMBEDDING_MODEL in .env validates; embedding calls stay hardcoded in EmbeddingService.
-    openai_embedding_model: str = Field(default="text-embedding-3-small")
-    openai_realtime_model: str = Field(default="gpt-4o-realtime-preview")
+    openai_embedding_model: str = Field(default="OPENAI_EMBEDDING_MODEL")
+    openai_realtime_model: str = Field(..., alias="OPENAI_VOICE_MODEL")
 
     jira_base_url: str = Field(alias="JIRA_BASE_URL")
     jira_email: str = Field(alias="JIRA_EMAIL")
