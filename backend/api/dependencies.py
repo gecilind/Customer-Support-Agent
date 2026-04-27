@@ -21,6 +21,7 @@ from repositories.kb_repository import KBRepository
 from repositories.manual_repository import ManualRepository
 from repositories.ticket_repository import TicketRepository
 from services.chat_service import ChatService
+from services.conversation_service import ConversationService
 from services.embedding_service import EmbeddingService
 from services.health_service import HealthService
 from services.ingestion_service import IngestionService
@@ -88,6 +89,13 @@ def get_conversation_repository(session: AsyncSession = Depends(get_supabase_ses
     return ConversationRepository(session)
 
 
+def get_conversation_service(
+    conversation_repository: ConversationRepository = Depends(get_conversation_repository),
+    settings: Settings = Depends(get_app_settings),
+) -> ConversationService:
+    return ConversationService(conversation_repository, settings)
+
+
 def get_openai_client(settings: Settings = Depends(get_app_settings)) -> AsyncOpenAI:
     return AsyncOpenAI(api_key=settings.openai_api_key)
 
@@ -148,10 +156,9 @@ def get_chat_controller(chat_service: ChatService = Depends(get_chat_service)) -
 
 
 def get_conversation_controller(
-    conversation_repository: ConversationRepository = Depends(get_conversation_repository),
-    settings: Settings = Depends(get_app_settings),
+    conversation_service: ConversationService = Depends(get_conversation_service),
 ) -> ConversationController:
-    return ConversationController(conversation_repository, settings)
+    return ConversationController(conversation_service)
 
 
 def get_voice_service(
