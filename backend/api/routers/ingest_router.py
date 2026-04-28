@@ -1,10 +1,11 @@
 from fastapi import APIRouter, Depends, File, UploadFile
 
 from api.controllers.ingest_controller import IngestController
-from api.dependencies import get_ingest_controller, get_manual_controller, get_manual_repository
+from api.dependencies import get_ingest_controller, get_manual_controller, get_manual_repository, get_zendesk_service
 from api.controllers.manual_controller import ManualController
 from repositories.manual_repository import ManualRepository
-from schemas.ingestion import DeleteManualSourceResponse, IngestManualResponse, ManualSourceResponse
+from schemas.ingestion import DeleteManualSourceResponse, IngestManualResponse, IngestZendeskResponse, ManualSourceResponse
+from services.zendesk_service import ZendeskService
 
 
 router = APIRouter(tags=["ingestion"])
@@ -16,6 +17,14 @@ async def ingest_manual(
     controller: IngestController = Depends(get_ingest_controller),
 ) -> IngestManualResponse:
     return await controller.ingest_manual(file)
+
+
+@router.post("/ingest-zendesk", response_model=IngestZendeskResponse)
+async def ingest_zendesk(
+    controller: IngestController = Depends(get_ingest_controller),
+    zendesk_service: ZendeskService = Depends(get_zendesk_service),
+) -> IngestZendeskResponse:
+    return await controller.ingest_zendesk(zendesk_service)
 
 
 @router.get("/manuals", response_model=list[ManualSourceResponse])

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import re
 
+from core.exceptions import IngestionError
 from repositories.manual_repository import ManualRepository
 from services.embedding_service import EmbeddingService
+from services.zendesk_service import ZendeskArticle, ZendeskService
 
 # Numbered / decimal section titles: "1. Getting Started", "2.1 OPC UA", "2.1.1.1 How to use..."
 _RE_NUMBERED_HEADER = re.compile(r"^\d+(\.\d+)*\.?\s+\S")
@@ -301,3 +303,77 @@ class IngestionService:
                     chunks.append(piece)
                 start += max_chars
         return [(f"Part {idx + 1}", c) for idx, c in enumerate(chunks) if c]
+
+    async def ingest_zendesk(self, zendesk_service: ZendeskService) -> int:
+        """
+        Pulls all articles from Zendesk, chunks each title+body,
+        embeds, and saves via the existing manual_repository.
+        Returns total chunks saved.
+        """
+        articles: list[ZendeskArticle] = await zendesk_service.fetch_all_articles()
+
+        prefix = zendesk_service.source_url_prefix_for_deletion()
+        deleted = await self.manual_repository.delete_by_source_prefix(prefix=prefix)
+        if deleted:
+            print(f"[INGEST] Removed {deleted} existing chunk(s) under Zendesk source prefix")
+
+        categories_sorted = sorted({a.category_name for a in articles})
+        print(f"[INGEST] Source: zendesk")
+        print(f"[INGEST] Locale: {zendesk_service.locale}")
+        print(f"[INGEST] Articles fetched: {len(articles)}")
+        print(f"[INGEST] Categories: {categories_sorted}")
+
+        article_chunk_rows: list[tuple[ZendeskArticle, list[tuple[str, int, str]]]] = []
+        all_texts: list[str] = []
+
+        for article in sorted(articles, key=lambda a: (a.category_name, a.title, a.article_id)):
+            full = f"{article.title}\n\n{article.body_text}"
+            normalized = self._normalize_document_text(full)
+            if not normalized:
+                continue
+            rows: list[tuple[str, int, str]] = []
+            if len(normalized) <= 2000:
+                rows.append((article.section_name, 0, normalized))
+            else:
+                for idx, (_part_label, chunk_text) in enumerate(
+                    self._chunk_fallback_paragraphs(normalized, 2000)
+                ):
+                    if chunk_text.strip():
+                        rows.append((article.section_name, idx, chunk_text))
+            if not rows:
+                continue
+            article_chunk_rows.append((article, rows))
+            all_texts.extend(text for _, _, text in rows)
+
+        if not all_texts:
+            print("[INGEST] Total chunks created: 0")
+            return 0
+
+        all_embeddings: list[list[float]] = []
+        batch_size = 100
+        for start in range(0, len(all_texts), batch_size):
+            batch = all_texts[start : start + batch_size]
+            all_embeddings.extend(await self.embedding_service.generate(batch))
+
+        if len(all_embeddings) != len(all_texts):
+            raise IngestionError(
+                f"Embedding batch mismatch: texts={len(all_texts)}, embeddings={len(all_embeddings)}"
+            )
+
+        total_saved = 0
+        offset = 0
+        for article, rows in article_chunk_rows:
+            n = len(rows)
+            slice_emb = all_embeddings[offset : offset + n]
+            offset += n
+            sections_and_chunks = [
+                (rows[i][0], rows[i][1], rows[i][2], slice_emb[i]) for i in range(n)
+            ]
+            total_saved += await self.manual_repository.save_chunks(
+                source=article.html_url,
+                category=article.category_name,
+                sections_and_chunks=sections_and_chunks,
+            )
+
+        print(f"[INGEST] Total chunks created: {total_saved}")
+        return total_saved

@@ -27,6 +27,13 @@ class Settings(BaseSettings):
     jira_api_token: str = Field(alias="JIRA_API_TOKEN")
     jira_project_key: str = Field(alias="JIRA_PROJECT_KEY")
 
+    zendesk_help_center_url: str = Field(
+        default="https://hilfe.infleet.de",
+        alias="ZENDESK_HELP_CENTER_URL",
+    )
+    zendesk_locale: str = Field(default="de", alias="ZENDESK_LOCALE")
+    zendesk_articles_per_page: int = Field(default=100, alias="ZENDESK_ARTICLES_PER_PAGE")
+
     @classmethod
     def settings_customise_sources(
         cls,

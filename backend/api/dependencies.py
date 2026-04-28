@@ -25,6 +25,7 @@ from services.conversation_service import ConversationService
 from services.embedding_service import EmbeddingService
 from services.health_service import HealthService
 from services.ingestion_service import IngestionService
+from services.zendesk_service import ZendeskService
 from services.kb_service import KBService
 from services.manual_service import ManualService
 from services.ticket_service import TicketService
@@ -71,6 +72,10 @@ def get_ingestion_service(
     embedding_service: EmbeddingService = Depends(get_embedding_service),
 ) -> IngestionService:
     return IngestionService(manual_repository, embedding_service)
+
+
+def get_zendesk_service(settings: Settings = Depends(get_app_settings)) -> ZendeskService:
+    return ZendeskService(settings)
 
 
 def get_ingest_controller(ingestion_service: IngestionService = Depends(get_ingestion_service)) -> IngestController:

@@ -9,6 +9,12 @@ class IngestManualResponse(BaseModel):
     category: str
 
 
+class IngestZendeskResponse(BaseModel):
+    status: str
+    chunks_ingested: int
+    source: str
+
+
 class ManualSourceResponse(BaseModel):
     source: str
     category: str

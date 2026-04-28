@@ -1,9 +1,10 @@
 from fastapi import HTTPException, UploadFile
 
 from core.exceptions import IngestionError
-from schemas.ingestion import IngestManualResponse
+from schemas.ingestion import IngestManualResponse, IngestZendeskResponse
 from services.file_extraction_service import extract_text, is_pdf_bytes
 from services.ingestion_service import IngestionService
+from services.zendesk_service import ZendeskService
 
 
 class IngestController:
@@ -34,3 +35,10 @@ class IngestController:
             file_type=file_type,
         )
         return IngestManualResponse(source=source_name, chunks_saved=chunks_saved, category="general")
+
+    async def ingest_zendesk(self, zendesk_service: ZendeskService) -> IngestZendeskResponse:
+        try:
+            total = await self.ingestion_service.ingest_zendesk(zendesk_service)
+        except IngestionError as exc:
+            raise HTTPException(status_code=400, detail=exc.message) from exc
+        return IngestZendeskResponse(status="ok", chunks_ingested=total, source="zendesk")

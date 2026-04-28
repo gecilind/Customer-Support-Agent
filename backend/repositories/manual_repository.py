@@ -71,3 +71,9 @@ class ManualRepository:
         await self.session.commit()
         # SQLAlchemy may not populate rowcount for all DB drivers, but asyncpg typically does.
         return int(getattr(result, "rowcount", 0) or 0)
+
+    async def delete_by_source_prefix(self, *, prefix: str) -> int:
+        stmt = delete(Manual).where(Manual.source.like(f"{prefix}%"))
+        result = await self.session.execute(stmt)
+        await self.session.commit()
+        return int(getattr(result, "rowcount", 0) or 0)

@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 SQLAlchemy
 asyncpg
+beautifulsoup4
 pgvector
 alembic
 pydantic
