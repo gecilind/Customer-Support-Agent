@@ -18,14 +18,14 @@ class ConversationListItem(BaseModel):
 
 
 class ConversationDetailResponse(BaseModel):
-    """Metadata + optional Jira ticket for GET /conversations/{id}."""
+    """Metadata + ticket info for GET /conversations/{id}."""
 
     id: str
     status: str
     created_at: datetime
     updated_at: datetime
-    jira_ticket_id: str | None = None
-    jira_ticket_url: str | None = None
+    ticket_id: str | None = None
+    ticket_url: str | None = None
 
 
 class MessageResponse(BaseModel):

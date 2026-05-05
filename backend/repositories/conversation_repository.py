@@ -39,9 +39,9 @@ class ConversationRepository:
         result = await self.session.execute(stmt)
         return result.scalars().all()
 
-    async def get_latest_jira_ticket_id(self, conversation_id: int) -> str | None:
+    async def get_latest_ticket_id(self, conversation_id: int) -> str | None:
         stmt = (
-            select(Ticket.jira_ticket_id)
+            select(Ticket.ticket_id)
             .where(Ticket.conversation_id == conversation_id)
             .order_by(Ticket.created_at.desc())
             .limit(1)

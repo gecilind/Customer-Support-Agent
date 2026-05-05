@@ -43,7 +43,7 @@ interface ChatSseDone {
   conversation_id: string;
   message: string;
   sources: string[];
-  ticket: { jira_ticket_id: string; jira_ticket_url: string } | null;
+  ticket: { ticket_id: string; ticket_url: string } | null;
 }
 
 async function readChatSse(

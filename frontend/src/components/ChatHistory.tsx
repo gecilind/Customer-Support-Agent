@@ -19,8 +19,8 @@ interface ConversationDetail {
   status: string;
   created_at: string;
   updated_at: string;
-  jira_ticket_id: string | null;
-  jira_ticket_url: string | null;
+  ticket_id: string | null;
+  ticket_url: string | null;
 }
 
 function formatHeaderDate(iso: string): string {
@@ -130,21 +130,21 @@ export function ChatHistory({ conversationId, onBack }: ChatHistoryProps) {
             {detail ? (
               <p className="text-xs text-slate-500 mt-0.5 truncate">
                 {formatHeaderDate(detail.created_at)}
-                {detail.jira_ticket_id ? (
+                {detail.ticket_id ? (
                   <span className="text-slate-600">
                     {' '}
                     · Ticket{' '}
-                    {detail.jira_ticket_url ? (
+                    {detail.ticket_url ? (
                       <a
-                        href={detail.jira_ticket_url}
+                        href={detail.ticket_url}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="text-blue-900 underline hover:text-blue-800"
                       >
-                        {detail.jira_ticket_id}
+                        {detail.ticket_id}
                       </a>
                     ) : (
-                      detail.jira_ticket_id
+                      detail.ticket_id
                     )}
                   </span>
                 ) : null}

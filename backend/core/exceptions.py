@@ -16,3 +16,11 @@ class JiraAPIError(AppError):
     def __init__(self, message: str) -> None:
         self.message = message
         super().__init__(message)
+
+
+class ZendeskAPIError(AppError):
+    """Raised when Zendesk REST API call fails."""
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+        super().__init__(message)

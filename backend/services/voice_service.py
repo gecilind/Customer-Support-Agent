@@ -397,7 +397,7 @@ class VoiceService:
                         pass
 
                     ticket_url = (
-                        chat_response.jira_ticket_url
+                        chat_response.ticket_url
                         if chat_response is not None
                         else None
                     )

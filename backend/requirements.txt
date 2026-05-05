@@ -14,3 +14,4 @@ httpx
 websockets>=12
 pypdf
 pymupdf
+langdetect

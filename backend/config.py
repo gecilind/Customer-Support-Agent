@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     jira_api_token: str = Field(alias="JIRA_API_TOKEN")
     jira_project_key: str = Field(alias="JIRA_PROJECT_KEY")
 
+    zendesk_subdomain: str = Field(alias="ZENDESK_SUBDOMAIN")
+    zendesk_email: str = Field(alias="ZENDESK_EMAIL")
+    zendesk_api_token: str = Field(alias="ZENDESK_API_TOKEN")
+
     zendesk_help_center_url: str = Field(
         default="https://hilfe.infleet.de",
         alias="ZENDESK_HELP_CENTER_URL",

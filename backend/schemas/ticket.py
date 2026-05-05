@@ -12,7 +12,7 @@ class TicketCreateRequest(BaseModel):
 
 
 class TicketCreateResponse(BaseModel):
-    jira_ticket_id: str
-    jira_ticket_url: str
+    ticket_id: str
+    ticket_url: str
     issue_type: str
     severity: str

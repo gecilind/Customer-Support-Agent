@@ -18,7 +18,7 @@ You are a **Senior Technical Co-Pilot and Lead Solutions Architect** working wit
 
 **Client:** Infleet — requires an AI-driven hardware/software support agent for GPS tracking devices.
 
-**Product:** A chatbot that answers user questions from an ingested knowledge base (RAG), and when it cannot answer, escalates to human support via Jira ticket creation.
+**Product:** A chatbot that answers user questions from a Zendesk-backed knowledge base (RAG), and when it cannot resolve an issue, escalates to human support via Zendesk Support ticket creation.
 
 **Timeline:**
 - **Phase 1 (Current — 24 Days):** Web Chat MVP
@@ -43,7 +43,8 @@ Every technical decision must be optimized for the Phase 1 deadline. If a featur
 | **Backend** | Python + FastAPI | All business logic lives here. Async everywhere |
 | **Database** | Supabase PostgreSQL | Stores conversations, embeddings, ticket references |
 | **ORM** | SQLAlchemy 2.0 async + `pgvector.sqlalchemy` | No raw SQL for our DB. Raw `asyncpg` only for Infleet's external DB |
-| **Ticketing** | Jira REST API via `httpx` | No SDK, no middleware |
+| **Ticketing** | Zendesk Support REST API via `httpx` | No SDK, no middleware |
+| **Knowledge Base Source** | Zendesk Help Center API (`hilfe.infleet.de/api/v2/help_center/de/`) | Categories → Sections → Articles (German). Fetched via `httpx`, HTML stripped, chunked, embedded. |
 | **Voice Transport** | OpenAI Realtime API via WebSocket relay (`/voice-relay`) | Phase 2. No telephony, no Twilio, no Vapi |
 
 ---
@@ -57,7 +58,7 @@ backend/
 ├── main.py                     # App factory, lifespan, pool init, middleware + routers
 ├── config.py                   # pydantic-settings (validated at startup)
 ├── core/
-│   └── exceptions.py           # AppError base + JiraAPIError, KBSearchError, AIServiceError, IngestionError
+│   └── exceptions.py           # AppError base + ZendeskAPIError, IngestionError (+ other subclasses as needed)
 ├── middleware/
 │   ├── request_handler.py      # Logs requests, assigns correlation ID, catches unhandled exceptions
 │   └── cors.py                 # CORS headers for React widget
@@ -71,32 +72,36 @@ backend/
 │   ├── chat.py                 # ChatRequest, ChatResponse
 │   ├── conversation.py         # ConversationResponse, MessageResponse
 │   ├── kb.py                   # KBSearchResult
-│   ├── ingestion.py            # IngestRequest, IngestResponse
-│   └── ticket.py               # TicketCreateRequest, TicketCreateResponse (future)
+│   ├── zendesk.py              # ZendeskSyncRequest, ZendeskSyncResponse
+│   ├── ticket.py               # TicketCreateRequest, TicketCreateResponse
+│   └── zendesk_ticket.py       # ZendeskTicketRequest, ZendeskTicketResponse
 ├── db/
 │   ├── supabase_pool.py        # SQLAlchemy async engine + session factory
 │   └── migrations/             # Alembic migrations (auto-generated from models)
 ├── repositories/               # Data access layer
 │   ├── kb_repository.py        # pgvector ORM search → Manual.embedding.cosine_distance()
 │   ├── conversation_repository.py  # Conversation + Message CRUD
-│   ├── manual_repository.py    # Manual chunk save
+│   ├── manual_repository.py    # Article chunk save (upsert by article_id)
 │   └── health_repository.py    # SELECT 1 connectivity check
 ├── services/                   # Business logic
-│   ├── chat_service.py         # Orchestrator: KB search → confidence tiers → OpenAI → save
+│   ├── chat_service.py         # Orchestrator: KB search → confidence tiers → OpenAI → save → Zendesk ticket on escalation
 │   ├── kb_service.py           # Embeds query → calls kb_repository.search()
 │   ├── embedding_service.py    # OpenAI text-embedding-3-small wrapper
-│   ├── ingestion_service.py    # File chunking (section detection, multi-format)
-│   └── file_extraction_service.py  # PDF/TXT text extraction
+│   ├── ticket_service.py       # Persists `tickets` rows; wires ticket repository for programmatic create
+│   ├── zendesk_service.py      # Fetches Zendesk categories/sections/articles, strips HTML, chunks, embeds, stores
+│   └── zendesk_ticket_service.py  # POST Zendesk Support `/api/v2/tickets.json` (chat escalation)
 ├── api/
 │   ├── dependencies.py         # DI wiring — Depends() factories for all layers
 │   ├── controllers/
 │   │   ├── chat_controller.py
 │   │   ├── conversation_controller.py
-│   │   └── ingest_controller.py
+│   │   ├── ticket_controller.py
+│   │   └── zendesk_controller.py
 │   └── routers/
 │       ├── chat_router.py      # POST /chat
 │       ├── conversation_router.py  # POST /conversations, GET /conversations/{id}/messages
-│       ├── ingest_router.py    # POST /ingest-manual
+│       ├── ticket_router.py    # POST /create-ticket (optional programmatic create)
+│       ├── zendesk_router.py   # POST /sync-zendesk
 │       └── health_router.py    # GET /health
 ```
 
@@ -121,7 +126,7 @@ Router → Controller → Service → Repository
 | DB driver | `asyncpg` underneath SQLAlchemy async engine | No `psycopg2`, no sync drivers |
 | Migrations | Alembic (auto-generates from SQLAlchemy models) | No manual SQL migrations |
 | pgvector | `pgvector.sqlalchemy` extension (ORM cosine_distance) | No raw vector SQL for our DB |
-| HTTP client | `httpx.AsyncClient` (for Jira) | No `requests`, no `aiohttp` |
+| HTTP client | `httpx.AsyncClient` (Zendesk Help Center + Zendesk Support) | No `requests`, no `aiohttp` |
 | Schemas/DTOs | `pydantic.BaseModel` | No dataclasses, no TypedDict |
 | Config | `pydantic-settings.BaseSettings` | No `os.environ` scattered in code |
 | DI | FastAPI `Depends()` factories in `dependencies.py` | No DI framework, no global singletons |
@@ -138,20 +143,21 @@ Router → Controller → Service → Repository
 **4 tables** in Supabase PostgreSQL:
 
 ### manuals
-Document chunks + embeddings for RAG. Each row = one chunk of a source document.
+Article chunks + embeddings for RAG. Each row = one chunk of a Zendesk Help Center article.
 
 | Column | Type | Notes |
 |---|---|---|
 | id | SERIAL PK | |
-| source | VARCHAR(500) NOT NULL | Origin filename |
-| section | VARCHAR(500) NOT NULL | Real section heading from document |
-| content | TEXT NOT NULL | The chunk text |
-| category | VARCHAR(100) NOT NULL DEFAULT 'general' | Filter tag |
-| chunk_index | INTEGER NOT NULL DEFAULT 0 | Position in document |
+| article_id | BIGINT NOT NULL | Zendesk article numeric ID — used for upsert keying |
+| source | VARCHAR(500) NOT NULL | Zendesk article `html_url` (e.g., `https://hilfe.infleet.de/hc/de/articles/123-Title`) |
+| section | VARCHAR(500) NOT NULL | Zendesk section `name` (e.g., "Hardware-Anleitungen") |
+| content | TEXT NOT NULL | Plain-text chunk extracted from article HTML body |
+| category | VARCHAR(100) NOT NULL DEFAULT 'general' | Zendesk category `name` (e.g., "Hardware", "Software") |
+| chunk_index | INTEGER NOT NULL DEFAULT 0 | Position of this chunk within the article |
 | embedding | VECTOR(1536) | pgvector, text-embedding-3-small |
 | created_at | TIMESTAMPTZ NOT NULL DEFAULT NOW() | |
 
-**Indexes:** HNSW on embedding (m=16, ef_construction=64), BTREE on category, BTREE on source.
+**Indexes:** HNSW on embedding (m=16, ef_construction=64), BTREE on category, BTREE on article_id.
 
 ### conversations
 One row per chat session.
@@ -177,16 +183,16 @@ Individual messages within a conversation.
 | created_at | TIMESTAMPTZ NOT NULL DEFAULT NOW() | |
 
 ### tickets
-References to Jira tickets created during conversations.
+References to Zendesk support tickets created during conversations (numeric ticket id stored as text).
 
 | Column | Type | Notes |
 |---|---|---|
 | id | SERIAL PK | |
 | conversation_id | INTEGER NOT NULL FK → conversations.id | |
-| jira_ticket_id | VARCHAR(100) NOT NULL | e.g., "SUPPORT-1847" |
-| jira_ticket_url | VARCHAR(500) | |
-| summary | TEXT NOT NULL | |
-| status | VARCHAR(50) NOT NULL DEFAULT 'open' | |
+| ticket_id | VARCHAR(100) NOT NULL UNIQUE | Zendesk ticket id (e.g. `"12345"`) |
+| issue_type | VARCHAR(100) NOT NULL | AI label (e.g. `hardware_failure`) |
+| severity | VARCHAR(50) NOT NULL DEFAULT 'medium' | Mapped to ticket priority in Zendesk |
+| device_serial | VARCHAR(200) NULL | Collected during conversation when applicable |
 | created_at | TIMESTAMPTZ NOT NULL DEFAULT NOW() | |
 
 ---
@@ -226,23 +232,37 @@ User message → React frontend
 ```
 KB search fails → AI cannot resolve
   → collect device info (serial number or vehicle name)
-  → POST /create-ticket (Jira REST API)
-  → human agent handles it
+  → Zendesk Support API (create ticket) + row in `tickets` (ticket_id)
+  → human agent handles it in Zendesk
 ```
 
 Device identification is handled by the AI during conversation — the user is asked to provide their device serial number or vehicle name before a ticket is created.
 
-### Ingestion Path
+### Zendesk Sync Path
 
 ```
-Upload file → POST /ingest-manual
-  → Extract text (PDF via pypdf, TXT via UTF-8 decode)
-  → Detect section headers (numbered, nested, markdown, chapter, ALL CAPS)
-  → Group content under headers, split large sections at paragraph boundaries
+POST /sync-zendesk (admin trigger)
+  → Fetch categories from Zendesk Help Center API (de locale)
+  → Fetch sections per category
+  → Fetch all articles paginated (page=1..N, per_page=100)
+  → For each article: strip HTML body → plain text
+  → Chunk text (max_chars=2000, paragraph-boundary splits)
   → Embed all chunks via text-embedding-3-small (batch)
-  → Save chunks + embeddings to manuals table
-  → Log: filename, type, section count, chunk count, section labels
+  → Upsert chunks + embeddings into manuals table (keyed by article_id + chunk_index)
+  → Log: category count, section count, article count, chunk count
 ```
+
+**Zendesk API endpoints used:**
+- `GET /api/v2/help_center/de/categories.json`
+- `GET /api/v2/help_center/de/sections.json`
+- `GET /api/v2/help_center/de/articles.json?page={n}&per_page=100`
+
+**Data mapping to `manuals` table:**
+- `source` → article `html_url` (e.g., `https://hilfe.infleet.de/hc/de/articles/123-Title`)
+- `section` → Zendesk section `name` (e.g., "Hardware-Anleitungen")
+- `category` → Zendesk category `name` (e.g., "Hardware", "Software", "Allgemein")
+- `content` → plain-text chunk extracted from article `body` (HTML stripped)
+- `article_id` → Zendesk article numeric `id` (stored for upsert keying)
 
 ---
 
@@ -275,7 +295,7 @@ All requests logged to terminal:
 🔄 Reformulated:     "How can I restore a license?"
 📊 KB Similarity:    0.656 | 0.574 | 0.565 | 0.455 | 0.446
 🎯 Confidence Tier:  HIGH (top=0.656)
-📖 Source:           Public FAQ-v13-20240610_075228.pdf — Section: 3.3.2.2 How to restore a license
+📖 Source:           https://hilfe.infleet.de/hc/de/articles/123-Lizenz-wiederherstellen — Section: Infleet
 🔍 KB Search Time:    1.36s
 🤖 OpenAI Time:    7.92s
 ⏱️ Response Time:    11.81s
@@ -300,19 +320,17 @@ First-message skip (greeting path — no KB search):
 
 ## Chunking Strategy
 
-Section detection supports:
-- Simple numbered: `1. Getting Started`
-- Nested numbered: `2.1.1.1 How to use the OPC UA Client`
-- Chapter style: `Chapter 1: Overview`
-- ALL CAPS headers (3-100 chars, preceded by blank line)
-- Markdown: `# Heading`, `## Sub Heading`
+Source is Zendesk article HTML body (German). Pipeline:
+1. Strip HTML tags → plain text (via `beautifulsoup4`)
+2. Split on paragraph boundaries (`\n\n`)
+3. Merge short paragraphs; split large paragraphs so no chunk exceeds `max_chars`
+4. Each chunk shares the article's section name and category name as metadata
 
 Rules:
-- Header stays attached to its content — never split into separate chunk
-- Large sections split at paragraph boundaries; all sub-chunks share the same section label
-- No headers detected → fallback to paragraph splitting with "Part 1", "Part 2" labels
 - max_chars = 2000 per chunk
-- Supported file types: `.txt`, `.pdf`
+- All chunks from the same article share the same `section` and `category` values
+- Chunk position tracked via `chunk_index` (0-based)
+- Re-sync deletes existing chunks for the article (by `article_id`) before inserting new ones
 
 ---
 
@@ -344,10 +362,12 @@ Rules:
 |---|---|
 | `SUPABASE_DB_URL` | PostgreSQL connection string for our Supabase DB |
 | `OPENAI_KEY` | OpenAI API key for embeddings and chat |
-| `JIRA_BASE_URL` | Infleet's Jira instance URL (future) |
-| `JIRA_EMAIL` | Jira service account email (future) |
-| `JIRA_API_TOKEN` | Jira API token (future) |
-| `JIRA_PROJECT_KEY` | Jira project key for ticket creation (future) |
+| `ZENDESK_HELP_CENTER_URL` | Zendesk Help Center base (articles sync) |
+| `ZENDESK_LOCALE` | Help Center locale (e.g. `de`) |
+| `ZENDESK_ARTICLES_PER_PAGE` | Pagination size for article fetch |
+| `ZENDESK_SUBDOMAIN` | Zendesk account subdomain (Support API + agent URLs) |
+| `ZENDESK_EMAIL` | Zendesk API user email (Basic auth for Help Center sync + Support tickets) |
+| `ZENDESK_API_TOKEN` | Zendesk API token (`email/token` Basic auth) |
 
 ---
 
@@ -359,10 +379,10 @@ Rules:
 | `uvicorn` | ASGI server |
 | `openai` | OpenAI API client (async) |
 | `asyncpg` | Async PostgreSQL driver |
-| `httpx` | Async HTTP client (Jira calls) |
+| `httpx` | Async HTTP client (Zendesk Help Center + Zendesk Support API calls) |
 | `python-dotenv` | Env vars from `.env` in dev |
 | `pgvector` | SQLAlchemy pgvector integration |
-| `pypdf` | PDF text extraction |
+| `beautifulsoup4` | Strip HTML from Zendesk article bodies |
 | `pydantic-settings` | Config validation |
 | `sqlalchemy[asyncio]` | ORM |
 | `alembic` | Database migrations |
@@ -392,16 +412,16 @@ Specifically:
 
 ### Built and Working (Test Environment)
 - Full layered backend architecture (router → controller → service → repository)
-- Ingestion pipeline: upload → extract (PDF/TXT) → chunk (section detection) → embed → store
-- RAG search: pgvector cosine similarity via `pgvector.sqlalchemy` ORM
+- Zendesk sync pipeline: `POST /sync-zendesk` → fetch categories/sections/articles → strip HTML → chunk → embed → upsert into `manuals` table
+- RAG search: pgvector cosine similarity via `pgvector.sqlalchemy` ORM against Zendesk article chunks
 - Confidence tier system (HIGH/LOW/NONE) with terminal logging
 - Chat pipeline: frontend → backend → OpenAI gpt-4o-mini → response → DB
 - Conversations and messages persisted to PostgreSQL
 - Professional system prompt with varied greetings, clarification for vague questions
 - NONE tier sends to OpenAI without context (handles greetings, thanks, off-topic naturally)
 - Frontend chat widget with typewriter animation, auto-scroll, loading states
-- Tested with a 9-section GPS manual and a 446-page CODESYS FAQ (657 chunks)
-- Jira ticket creation (`POST /create-ticket`) — working in production (tickets CSA-50 through CSA-54 created successfully)
+- Knowledge base populated from Infleet's Zendesk Help Center (105 articles, 4 categories, 12 sections, all German)
+- Zendesk support ticket creation from chat escalation (`POST /chat` stream completes with `[CREATE_TICKET]` handling → Zendesk Support API + `tickets` row)
 - Query reformulation — runs on every follow-up message when conversation has prior user history; skipped on first message
 
 ### Not Yet Built (Intentionally Skipped for Test Env)

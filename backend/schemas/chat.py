@@ -11,4 +11,4 @@ class ChatResponse(BaseModel):
     message: str
     confidence_tier: str
     sources: list[str]
-    jira_ticket_url: str | None = None
+    ticket_url: str | None = None

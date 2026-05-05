@@ -13,7 +13,7 @@ class Ticket(Base):
     conversation_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    jira_ticket_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)
+    ticket_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)
     issue_type: Mapped[str] = mapped_column(String(100), nullable=False)
     severity: Mapped[str] = mapped_column(String(50), nullable=False, default="medium", server_default="medium")
     device_serial: Mapped[str | None] = mapped_column(String(200), nullable=True, index=True)

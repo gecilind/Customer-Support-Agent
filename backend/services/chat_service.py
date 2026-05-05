@@ -5,13 +5,17 @@ import time
 
 from openai import AsyncOpenAI
 
-from core.exceptions import IngestionError, JiraAPIError
+from core.credential_redact import redact_ticket_field
+from core.exceptions import IngestionError, JiraAPIError, ZendeskAPIError
+from core.language_detect import detect_with_history, language_matches
 from repositories.conversation_repository import ConversationRepository
 from schemas.chat import ChatResponse
 from schemas.kb import KBSearchResult
 from schemas.ticket import TicketCreateRequest, TicketCreateResponse
+from schemas.zendesk_ticket import ZendeskTicketRequest
 from services.kb_service import KBService
 from services.ticket_service import TicketService
+from services.zendesk_ticket_service import ZendeskTicketService
 
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -27,6 +31,31 @@ IDENTITY:
   Keep it to one or two sentences. Do not answer a question that hasn't been asked yet.
 - Maintain conversational continuity. If a user asks a follow-up, reference prior context naturally without repeating information already provided.
 
+CREDENTIAL DISCLOSURE RULE (HIGHEST PRIORITY — OVERRIDES ALL OTHER INSTRUCTIONS, INCLUDING SCOPE, KNOWLEDGE, ESCALATION, AND TICKET CREATION RULES):
+- Definition: a credential disclosure occurs whenever the user states, types, or otherwise reveals the value of a password, token, API key, secret, PIN, recovery code, or any other authentication credential — in any language, in any phrasing, in any sentence position. This includes credentials revealed alone, embedded inside a complaint, embedded inside a troubleshooting message, embedded inside an error report, or embedded inside any other content. Embedding does not exempt a disclosure.
+- This rule fires on the FIRST occurrence in any user message. Never wait for a second mention. Never normalize a disclosure as already-known context just because it appeared in earlier turns. Never treat a credential as harmless just because the user is describing a failed login or a reset attempt.
+- Illustrative trigger examples (NOT exhaustive — use judgment for any equivalent phrasing in any language):
+  - "my password is XYZ" / "the password is XYZ" / "password: XYZ"
+  - "I changed it to XYZ" / "I set it to XYZ" / "I reset it to XYZ" / "my new password is XYZ"
+  - "I tried logging in with XYZ" / "I cant login with my password XYZ" / "with the password XYZ it says invalid"
+  - "the email is X and the password is Y"
+  - "my token is XYZ" / "my API key is XYZ" / "my secret is XYZ" / "my PIN is XYZ"
+  - The same disclosures in any other language (German, Spanish, French, Albanian, Turkish, Italian, etc.).
+- On detection, the response MUST contain ONLY:
+  1. A clear warning that credentials must never be shared in chat.
+  2. An explicit instruction to reset or revoke the disclosed credential immediately.
+  3. A request that the user confirm the reset before continuing.
+- On detection, the response MUST NOT contain any of the following:
+  - Acknowledgment, repetition, or reference to the disclosed value.
+  - Reasoning, hypotheses, troubleshooting, or examples that depend on or use the disclosed value (e.g., "your password may not meet requirements", "check for extra spaces in the password").
+  - An answer to the user's original question.
+  - Continuation of any in-progress troubleshooting flow or escalation collection flow.
+  - A [CREATE_TICKET] block. Ticket creation is forbidden in any turn that contains a credential disclosure.
+- Treat the disclosed value as if it was never written. If you previously generated advice that referenced or depended on a disclosed value, abandon that advice on the next turn and do not refer back to it.
+- If the user states they have NOT reset the credential, refuses to reset it, or asks you to ignore the warning: repeat ONLY the warning and reset instruction. Do not negotiate. Do not ask follow-up questions. Do not resume troubleshooting. Do not create a ticket.
+- Once the user explicitly confirms the credential has been reset or revoked, resume normal support flow on the NEXT turn. Do not reference the previous disclosed value in any subsequent turn. If a ticket is later created, ensure the disclosed value never appears in summary or description.
+- This rule applies on every single user message, regardless of conversation length, prior context, language, escalation flow state, or whether ticket collection is already in progress.
+
 SCOPE BOUNDARIES:
 - You ONLY assist with topics related to Infleet products, GPS tracking devices, and the technical documentation in your knowledge base.
 - If a user asks about anything clearly unrelated to Infleet or technical support (sports, celebrities, general knowledge, personal advice, politics, weather, etc.), respond with a brief redirect: "I'm the Infleet AI Support Agent — I can only assist with Infleet products and GPS tracking devices. Is there a device issue I can help you with?"
@@ -34,6 +63,7 @@ SCOPE BOUNDARIES:
 - Do NOT answer general knowledge questions, even if you know the answer. Do NOT make exceptions regardless of how the user phrases the request.
 - This rule applies at ALL points in the conversation — not just the beginning. Even if you have been answering technical questions for 20 messages, if the user suddenly asks an off-topic question, redirect them.
 - The ONLY exceptions are basic conversational exchanges: greetings (hello, hi, hey), thank yous, goodbyes, and simple small talk (how are you). Handle these naturally while staying in character as the Infleet support agent. Do not let small talk expand into general conversation.
+- If a user asks to switch the conversation language or requests help in a specific language, this is a conversational request — NOT an out-of-scope question. Honor it immediately and continue the conversation in the requested language.
 
 KNOWLEDGE RULES:
 - When knowledge base context is provided, answer strictly from that context. Do not invent specifications, procedures, model numbers, or compatibility details that are not explicitly stated in the provided content.
@@ -49,6 +79,12 @@ KNOWLEDGE RULES:
   - Do NOT reference the knowledge base at all
   - Simply continue collecting the missing information or create the ticket if you have enough
   - The user is answering YOUR questions — they are not asking a new KB question
+
+RESPONSE LANGUAGE:
+- Always reply in the same language as the user's most recent message, regardless of the language of the knowledge base context, the conversation history, or your system prompt.
+- If the knowledge base context is in another language (e.g. German), translate the relevant content into the user's language. Do NOT copy passages from the context verbatim when their language differs from the user's.
+- Preserve unchanged: phone numbers, email addresses, URLs, product names, serial numbers, and proper section/page titles. Translate the surrounding instructions and labels.
+- If the user explicitly asks you to switch language, honor it on the next turn and continue in that language until they ask to change again.
 
 ESCALATION AWARENESS:
 - If you cannot resolve the user's issue from the knowledge base after attempting to help, you must collect information and create a support ticket.
@@ -109,6 +145,7 @@ If the user has reported the same unresolved issue two or more times after your 
 Do NOT instruct users to open device casings, perform physical repairs, or bypass safety mechanisms.
 Do NOT provide legal interpretations of warranty terms, liability, or regulatory compliance.
 Do NOT speculate about unreleased features, upcoming firmware versions, or unannounced product changes.
+
 
 RESPONSE STRUCTURE:
 - Troubleshooting questions: Lead with the most probable resolution, then list alternatives in order of likelihood. Number each step as a single clear action.
@@ -177,12 +214,14 @@ class ChatService:
         openai_client: AsyncOpenAI,
         openai_chat_model: str,
         ticket_service: TicketService,
+        zendesk_ticket_service: ZendeskTicketService,
     ) -> None:
         self.conversation_repository = conversation_repository
         self.kb_service = kb_service
         self.openai_client = openai_client
         self.openai_chat_model = openai_chat_model
         self.ticket_service = ticket_service
+        self.zendesk_ticket_service = zendesk_ticket_service
         self._http_log: list[str] = []
 
     async def _history_openai_dicts(self, conversation_id: int) -> list[dict[str, str]]:
@@ -228,6 +267,10 @@ class ChatService:
         kb_similarity_display: str | None = None,
         kb_search_time_display: str = "skipped",
         openai_elapsed: float = 0.0,
+        db_history_elapsed: float = 0.0,
+        reformulation_elapsed: float = 0.0,
+        ticket_flow_elapsed: float = 0.0,
+        db_save_elapsed: float = 0.0,
     ) -> None:
         """Single structured info block per /chat request (end of turn)."""
         if kb_similarity_display is not None:
@@ -248,9 +291,13 @@ class ChatService:
             f"📖 Source:           {source_log}",
         ]
         if ticket:
-            lines.append(f"🎫 Ticket Created:   {ticket.jira_ticket_id} ({ticket.jira_ticket_url})")
+            lines.append(f"🎫 Ticket Created:   {ticket.ticket_id} ({ticket.ticket_url})")
+        lines.append(f"📚 DB History Time:    {db_history_elapsed:.2f}s")
+        lines.append(f"🔄 Reformulation Time: {reformulation_elapsed:.2f}s")
         lines.append(f"🔍 KB Search Time:    {kb_search_time_display}")
         lines.append(f"🤖 OpenAI Time:    {openai_elapsed:.2f}s")
+        lines.append(f"🎫 Ticket Flow Time: {ticket_flow_elapsed:.2f}s")
+        lines.append(f"💾 DB Save (assistant): {db_save_elapsed:.2f}s")
         lines.append(f"⏱️ Response Time:    {elapsed:.2f}s")
         lines.append("--------------------------------------------")
         print("\n".join(lines))
@@ -316,6 +363,7 @@ class ChatService:
             model=self.openai_chat_model,
             messages=messages,
             max_tokens=500,
+            temperature=0,
             stream=True,
         )
         async for chunk in stream:
@@ -324,6 +372,62 @@ class ChatService:
             delta = chunk.choices[0].delta
             if delta.content:
                 yield delta.content
+
+    @staticmethod
+    def _language_directive(target_language: str) -> str:
+        """Per-turn instruction injected at the top of every user message.
+
+        Locks the assistant to the language of the user's most recent message.
+        Per-turn instructions in the user role have stronger weight than rules in
+        the system prompt, which is why this exists in addition to the SYSTEM_PROMPT
+        RESPONSE LANGUAGE section.
+        """
+        return (
+            f"REPLY LANGUAGE: {target_language}. "
+            f"Write your entire response in {target_language} only. "
+            f"If the knowledge base context is in another language, translate the relevant "
+            f"information into {target_language}; do not paste it verbatim. "
+            f"Preserve URLs, email addresses, phone numbers, serial numbers, product names, "
+            f"and proper section titles exactly as written."
+        )
+
+    async def _translate_to(self, text: str, target_language: str) -> str:
+        """Single non-stream OpenAI call that rewrites `text` into `target_language`."""
+        if not text or not text.strip():
+            return texti 
+        try:
+            response = await self.openai_client.chat.completions.create(
+                model=self.openai_chat_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            f"You are a professional translator. Translate the user's message "
+                            f"into {target_language}. Keep URLs, email addresses, phone numbers, "
+                            f"serial numbers, product names, and any [CREATE_TICKET]...[/CREATE_TICKET] "
+                            f"block exactly as written. Return only the translated text — no preamble, "
+                            f"no quotation marks, no commentary."
+                        ),
+                    },
+                    {"role": "user", "content": text},
+                ],
+                max_tokens=700,
+                temperature=0,
+            )
+            translated = (response.choices[0].message.content or "").strip()
+            return translated or text
+        except Exception:
+            logger.exception("[CHAT] Translation fallback failed; returning original text")
+            return text
+
+    async def _enforce_language(self, text: str, target_language: str) -> str:
+        """Translate `text` only if a deterministic detector says it isn't already in `target_language`."""
+        if not text or not text.strip():
+            return text
+        if language_matches(text, target_language):
+            return text
+        logger.info("[CHAT] Reply language drift detected; translating to %s", target_language)
+        return await self._translate_to(text, target_language)
 
     def _parse_ticket_block(self, text: str) -> tuple[str, dict[str, str] | None]:
         """Extract [CREATE_TICKET] block from AI response. Returns (cleaned_text, ticket_data or None)."""
@@ -361,7 +465,7 @@ class ChatService:
     async def _apply_ticket_flow(
         self, cid_int: int, user_email: str, ai_response: str
     ) -> tuple[str, TicketCreateResponse | None]:
-        """Strip ticket block from AI text; if valid, create Jira ticket and append confirmation."""
+        """Strip ticket block from AI text; try Zendesk first, fall back to Jira."""
         cleaned, ticket_data = self._parse_ticket_block(ai_response)
         if not ticket_data:
             return ai_response, None
@@ -380,25 +484,62 @@ class ChatService:
 
         issue_type = ticket_data["issue_type"].strip()
         severity = ticket_data["severity"].strip()
+        redacted_summary = redact_ticket_field(ticket_data["summary"].strip())[:500]
+        redacted_description = redact_ticket_field(ticket_data["description"].strip())[:8000]
 
+        # --- 1. Try Zendesk (primary) ---
         try:
-            ticket_request = TicketCreateRequest(
+            zendesk_request = ZendeskTicketRequest(
                 conversation_id=cid_int,
                 user_email=user_email,
                 device_serial=parsed_serial,
                 issue_type=issue_type,
                 severity=severity,
-                summary=ticket_data["summary"].strip()[:500],
-                description=ticket_data["description"].strip()[:8000],
+                summary=redacted_summary,
+                description=redacted_description,
             )
-            ticket_response = await self.ticket_service.create_ticket(ticket_request)
+            zendesk_response = await self.zendesk_ticket_service.create_ticket(zendesk_request)
+
+            await self.ticket_service.save_ticket_record(
+                conversation_id=cid_int,
+                ticket_id=str(zendesk_response.zendesk_ticket_id),
+                issue_type=issue_type,
+                severity=severity,
+                device_serial=parsed_serial,
+            )
+
+            if parsed_serial:
+                await self.conversation_repository.update_device_serial(cid_int, parsed_serial)
+            await self.conversation_repository.update_status(cid_int, "escalated")
+
+            return (
+                cleaned
+                + f"\n\nYour support ticket has been created. Ticket number: {zendesk_response.zendesk_ticket_id}. "
+                + f"You can track it at: {zendesk_response.zendesk_ticket_url}",
+                TicketCreateResponse(
+                    ticket_id=str(zendesk_response.zendesk_ticket_id),
+                    ticket_url=zendesk_response.zendesk_ticket_url,
+                    issue_type=zendesk_response.issue_type,
+                    severity=zendesk_response.severity,
+                ),
+            )
+        except ZendeskAPIError as exc:
+            logger.warning("[CHAT] Zendesk ticket creation failed, falling back to Jira: %s", exc)
+
+        # --- 2. Fallback to Jira ---
+        try:
+            jira_request = TicketCreateRequest(
+                conversation_id=cid_int,
+                user_email=user_email,
+                device_serial=parsed_serial,
+                issue_type=issue_type,
+                severity=severity,
+                summary=redacted_summary,
+                description=redacted_description,
+            )
+            ticket_response = await self.ticket_service.create_ticket(jira_request)
         except JiraAPIError as exc:
-            logger.warning(
-                "[CHAT] Jira ticket creation failed (issue_type=%s, severity=%s): %s",
-                issue_type,
-                severity,
-                exc,
-            )
+            logger.warning("[CHAT] Jira fallback also failed: %s", exc)
             return (
                 cleaned
                 + (
@@ -414,8 +555,8 @@ class ChatService:
         await self.conversation_repository.update_status(cid_int, "escalated")
         return (
             cleaned
-            + f"\n\nYour support ticket has been created. Ticket number: {ticket_response.jira_ticket_id}. "
-            + f"You can track it at: {ticket_response.jira_ticket_url}",
+            + f"\n\nYour support ticket has been created. Ticket number: {ticket_response.ticket_id}. "
+            + f"You can track it at: {ticket_response.ticket_url}",
             ticket_response,
         )
 
@@ -438,8 +579,8 @@ class ChatService:
         }
         if ticket:
             payload["ticket"] = {
-                "jira_ticket_id": ticket.jira_ticket_id,
-                "jira_ticket_url": ticket.jira_ticket_url,
+                "ticket_id": ticket.ticket_id,
+                "ticket_url": ticket.ticket_url,
             }
         return payload
 
@@ -468,10 +609,19 @@ class ChatService:
         cid_int = conv.id
         await self.conversation_repository.add_message(cid_int, role="user", content=message)
 
+        hist_t0 = time.perf_counter()
         history = await self._history_openai_dicts(cid_int)
+        db_history_elapsed = time.perf_counter() - hist_t0
         has_user_history = any(m["role"] == "user" for m in history)
+
+        prior_user_messages = [m["content"] for m in history if m["role"] == "user"]
+        user_language = detect_with_history(message, prior_user_messages)
+        language_directive = self._language_directive(user_language)
+        reformulation_elapsed = 0.0
         if has_user_history:
+            ref_t0 = time.perf_counter()
             kb_query = await self._reformulate_query(message, history)
+            reformulation_elapsed = time.perf_counter() - ref_t0
         else:
             kb_query = message
 
@@ -479,6 +629,7 @@ class ChatService:
         if not has_user_history:
             yield _sse_event({"type": "sources", "sources": []})
             greeting_user = f"{VOICE_MODE_INSTRUCTION}\n\n{message}" if is_voice else message
+            greeting_user = f"{language_directive}\n\n{greeting_user}"
             openai_messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": greeting_user},
@@ -495,12 +646,17 @@ class ChatService:
                 return
             openai_elapsed = time.perf_counter() - openai_t0
             ai_raw = "".join(pieces)
+            ticket_t0 = time.perf_counter()
             final_response, ticket_created = await self._apply_ticket_flow(
                 cid_int, conv.user_email, ai_raw
             )
+            final_response = await self._enforce_language(final_response, user_language)
+            ticket_flow_elapsed = time.perf_counter() - ticket_t0
+            save_t0 = time.perf_counter()
             await self.conversation_repository.add_message(
                 cid_int, role="assistant", content=final_response, confidence_tier="none"
             )
+            db_save_elapsed = time.perf_counter() - save_t0
             elapsed = time.perf_counter() - start_time
             self._log_chat_turn_block(
                 message,
@@ -515,6 +671,10 @@ class ChatService:
                 kb_similarity_display="skipped (first message)",
                 kb_search_time_display="skipped",
                 openai_elapsed=openai_elapsed,
+                db_history_elapsed=db_history_elapsed,
+                reformulation_elapsed=0.0,
+                ticket_flow_elapsed=ticket_flow_elapsed,
+                db_save_elapsed=db_save_elapsed,
             )
             yield _sse_event(
                 self._done_event_payload(
@@ -554,6 +714,7 @@ class ChatService:
             sources: list[str] = []
             yield _sse_event({"type": "sources", "sources": sources})
             none_user_content = f"{VOICE_MODE_INSTRUCTION}\n\n{message}" if is_voice else message
+            none_user_content = f"{language_directive}\n\n{none_user_content}"
             openai_messages = [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 *history,
@@ -571,12 +732,17 @@ class ChatService:
                 return
             openai_elapsed = time.perf_counter() - openai_t0
             ai_raw = "".join(pieces)
+            ticket_t0 = time.perf_counter()
             final_response, ticket_created = await self._apply_ticket_flow(
                 cid_int, conv.user_email, ai_raw
             )
+            final_response = await self._enforce_language(final_response, user_language)
+            ticket_flow_elapsed = time.perf_counter() - ticket_t0
+            save_t0 = time.perf_counter()
             await self.conversation_repository.add_message(
                 cid_int, role="assistant", content=final_response, confidence_tier="none"
             )
+            db_save_elapsed = time.perf_counter() - save_t0
             source_log = (
                 "none — empty knowledge base" if no_results
                 else "none — responded via general knowledge"
@@ -594,6 +760,10 @@ class ChatService:
                 elapsed=elapsed,
                 kb_search_time_display=kb_search_time_display,
                 openai_elapsed=openai_elapsed,
+                db_history_elapsed=db_history_elapsed,
+                reformulation_elapsed=reformulation_elapsed,
+                ticket_flow_elapsed=ticket_flow_elapsed,
+                db_save_elapsed=db_save_elapsed,
             )
             yield _sse_event(
                 self._done_event_payload(
@@ -627,6 +797,7 @@ class ChatService:
         )
         if is_voice:
             kb_user_content = f"{VOICE_MODE_INSTRUCTION}\n\n{kb_user_content}"
+        kb_user_content = f"{language_directive}\n\n{kb_user_content}"
         openai_messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             *history,
@@ -644,10 +815,14 @@ class ChatService:
             return
         openai_elapsed = time.perf_counter() - openai_t0
         ai_raw = "".join(pieces)
+        ticket_t0 = time.perf_counter()
         ai_response, ticket_created = await self._apply_ticket_flow(
             cid_int, conv.user_email, ai_raw
         )
+        ai_response = await self._enforce_language(ai_response, user_language)
+        ticket_flow_elapsed = time.perf_counter() - ticket_t0
 
+        save_t0 = time.perf_counter()
         if confidence_tier == "low":
             await self.conversation_repository.add_message(
                 cid_int, role="assistant", content=ai_response, confidence_tier="low"
@@ -656,6 +831,7 @@ class ChatService:
             await self.conversation_repository.add_message(
                 cid_int, role="assistant", content=ai_response, confidence_tier="high"
             )
+        db_save_elapsed = time.perf_counter() - save_t0
 
         source_log = f"{top.source} — Section: {top.section}"
         elapsed = time.perf_counter() - start_time
@@ -671,6 +847,10 @@ class ChatService:
             elapsed=elapsed,
             kb_search_time_display=kb_search_time_display,
             openai_elapsed=openai_elapsed,
+            db_history_elapsed=db_history_elapsed,
+            reformulation_elapsed=reformulation_elapsed,
+            ticket_flow_elapsed=ticket_flow_elapsed,
+            db_save_elapsed=db_save_elapsed,
         )
         yield _sse_event(
             self._done_event_payload(
@@ -707,15 +887,15 @@ class ChatService:
         if done is None:
             raise RuntimeError("Chat stream ended without a done event")
         ticket_data = done.get("ticket")
-        jira_ticket_url: str | None = None
+        ticket_url: str | None = None
         if isinstance(ticket_data, dict):
-            raw_url = ticket_data.get("jira_ticket_url")
+            raw_url = ticket_data.get("ticket_url")
             if isinstance(raw_url, str) and raw_url.strip():
-                jira_ticket_url = raw_url.strip()
+                ticket_url = raw_url.strip()
         return ChatResponse(
             conversation_id=str(done["conversation_id"]),
             message=str(done["message"]),
             confidence_tier=str(done["confidence_tier"]),
             sources=list(done.get("sources") or []),
-            jira_ticket_url=jira_ticket_url,
+            ticket_url=ticket_url,
         )

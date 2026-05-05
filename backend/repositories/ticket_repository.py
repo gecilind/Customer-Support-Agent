@@ -103,7 +103,7 @@ class TicketRepository:
 
         ticket = Ticket(
             conversation_id=request.conversation_id,
-            jira_ticket_id=key,
+            ticket_id=key,
             issue_type=request.issue_type,
             severity=request.severity,
             device_serial=request.device_serial,
@@ -113,12 +113,36 @@ class TicketRepository:
             await self._session.commit()
         except IntegrityError as exc:
             await self._session.rollback()
-            raise ValueError("Could not save ticket reference (invalid conversation or duplicate Jira key).") from exc
+            raise ValueError("Could not save ticket reference (invalid conversation or duplicate ticket key).") from exc
 
-        jira_ticket_url = f"{base}/browse/{key}"
+        ticket_url = f"{base}/browse/{key}"
         return TicketCreateResponse(
-            jira_ticket_id=key,
-            jira_ticket_url=jira_ticket_url,
+            ticket_id=key,
+            ticket_url=ticket_url,
             issue_type=request.issue_type,
             severity=request.severity,
         )
+
+    async def save_ticket_record(
+        self,
+        *,
+        conversation_id: int,
+        ticket_id: str,
+        issue_type: str,
+        severity: str,
+        device_serial: str | None,
+    ) -> None:
+        """Persist a ticket row regardless of which external system created it."""
+        ticket = Ticket(
+            conversation_id=conversation_id,
+            ticket_id=ticket_id,
+            issue_type=issue_type,
+            severity=severity,
+            device_serial=device_serial,
+        )
+        self._session.add(ticket)
+        try:
+            await self._session.commit()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise ValueError("Could not save ticket reference (duplicate ticket key).") from exc

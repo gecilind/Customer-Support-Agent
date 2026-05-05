@@ -30,6 +30,7 @@ from services.kb_service import KBService
 from services.manual_service import ManualService
 from services.ticket_service import TicketService
 from services.voice_service import VoiceService
+from services.zendesk_ticket_service import ZendeskTicketService
 
 
 def get_app_settings() -> Settings:
@@ -128,10 +129,17 @@ def get_ticket_repository(
     )
 
 
+def get_zendesk_ticket_service(
+    settings: Settings = Depends(get_app_settings),
+) -> ZendeskTicketService:
+    return ZendeskTicketService(settings)
+
+
 def get_ticket_service(
     ticket_repository: TicketRepository = Depends(get_ticket_repository),
+    zendesk_ticket_service: ZendeskTicketService = Depends(get_zendesk_ticket_service),
 ) -> TicketService:
-    return TicketService(ticket_repository)
+    return TicketService(ticket_repository, zendesk_ticket_service)
 
 
 def get_ticket_controller(
@@ -146,6 +154,7 @@ def get_chat_service(
     openai_client: AsyncOpenAI = Depends(get_openai_client),
     settings: Settings = Depends(get_app_settings),
     ticket_service: TicketService = Depends(get_ticket_service),
+    zendesk_ticket_service: ZendeskTicketService = Depends(get_zendesk_ticket_service),
 ) -> ChatService:
     return ChatService(
         conversation_repository,
@@ -153,6 +162,7 @@ def get_chat_service(
         openai_client,
         settings.openai_chat_model,
         ticket_service,
+        zendesk_ticket_service,
     )
 
 
